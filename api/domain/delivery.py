@@ -1,6 +1,7 @@
-from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DeliveryStatus(StrEnum):
@@ -8,9 +9,10 @@ class DeliveryStatus(StrEnum):
     DELIVERED = "delivered"
 
 
-@dataclass
-class Delivery:
-    id: UUID = field(default_factory=uuid4)
+class Delivery(BaseModel):
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
+    id: UUID = Field(default_factory=uuid4)
     status: DeliveryStatus = DeliveryStatus.PENDING
 
     def mark_delivered(self) -> None:

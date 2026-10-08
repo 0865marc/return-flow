@@ -1,6 +1,7 @@
-from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from .delivery import Delivery, DeliveryStatus
 
@@ -10,10 +11,11 @@ class ReturnStatus(StrEnum):
     COMPLETED = "completed"
 
 
-@dataclass
-class Return:
+class Return(BaseModel):
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
     delivery_id: UUID
-    id: UUID = field(default_factory=uuid4)
+    id: UUID = Field(default_factory=uuid4)
     status: ReturnStatus = ReturnStatus.REQUESTED
 
     @classmethod
