@@ -1,0 +1,39 @@
+services:
+  api:
+    build: ./api
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./api:/api
+    environment:
+      DATABASE_URL: postgresql://return_flow:return_flow@postgres:5432/return_flow
+      RABBITMQ_URL: amqp://return_flow:return_flow@rabbitmq:5672/
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: return_flow
+      POSTGRES_USER: return_flow
+      POSTGRES_PASSWORD: return_flow
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: return_flow
+      RABBITMQ_DEFAULT_PASS: return_flow
+    ports:
+      - "127.0.0.1:5672:5672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
