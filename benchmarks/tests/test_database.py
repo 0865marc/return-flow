@@ -1,9 +1,10 @@
 import json
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
-from benchmarks.database import benchmark_connection, read_receipts, reconcile, seed_id
+from benchmarks.database import benchmark_connection, main, read_receipts, reconcile, seed_id, wait_idle
 
 
 @pytest.fixture
@@ -152,3 +153,112 @@ def test_development_databases_are_rejected_before_connecting(monkeypatch, url):
     monkeypatch.setattr("benchmarks.database.psycopg.connect", unsafe_connection)
     with pytest.raises(ValueError, match="require database"):
         benchmark_connection()
+
+
+class ActivityConnection:
+    def __init__(self, counts):
+        self.counts = iter(counts)
+        self.remaining = None
+        self.autocommit = False
+        self.queries = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.closed = True
+
+    def execute(self, query):
+        assert self.autocommit, "Polling must not reuse a transaction's activity snapshot."
+        self.queries.append(query)
+        self.remaining = next(self.counts, self.remaining)
+        return SimpleNamespace(fetchone=lambda: (self.remaining,))
+
+
+@pytest.fixture
+def idle_clock(monkeypatch):
+    clock = SimpleNamespace(elapsed=0.0, sleeps=[])
+
+    def sleep(seconds):
+        clock.sleeps.append(seconds)
+        clock.elapsed += seconds
+
+    monkeypatch.setattr("benchmarks.database.time.monotonic", lambda: clock.elapsed)
+    monkeypatch.setattr("benchmarks.database.time.sleep", sleep)
+    return clock
+
+
+def test_wait_idle_waits_for_all_other_database_clients(monkeypatch, idle_clock):
+    connection = ActivityConnection([2, 1, 0])
+    monkeypatch.setattr("benchmarks.database.benchmark_connection", lambda: connection)
+
+    result = wait_idle(1)
+
+    assert result == {"status": "passed", "remaining_connections": 0, "waited_seconds": 0.4}
+    assert idle_clock.sleeps == [0.2, 0.2]
+    assert connection.closed
+    assert len(connection.queries) == 3
+    for query in connection.queries:
+        assert query.strip().startswith("SELECT count(*) FROM pg_stat_activity")
+        assert "datname = current_database()" in query
+        assert "backend_type = 'client backend'" in query
+        assert "pid <> pg_backend_pid()" in query
+        assert "state =" not in query  # Idle sessions must also disappear before reseeding.
+
+
+def test_wait_idle_returns_immediately_when_no_clients_remain(monkeypatch, idle_clock):
+    connection = ActivityConnection([0])
+    monkeypatch.setattr("benchmarks.database.benchmark_connection", lambda: connection)
+
+    assert wait_idle(1)["waited_seconds"] == 0
+    assert idle_clock.sleeps == []
+    assert connection.closed
+
+
+def test_wait_idle_stops_at_deadline_without_terminating_clients(monkeypatch, idle_clock):
+    connection = ActivityConnection([2])
+    monkeypatch.setattr("benchmarks.database.benchmark_connection", lambda: connection)
+
+    with pytest.raises(TimeoutError, match=r"2 client connection\(s\).*unsafe"):
+        wait_idle(0.5)
+
+    assert idle_clock.elapsed == pytest.approx(0.5)
+    assert idle_clock.sleeps == pytest.approx([0.2, 0.2, 0.1])
+    assert connection.closed
+    assert all(query.strip().startswith("SELECT count(*)") for query in connection.queries)
+
+
+def test_wait_idle_cli_records_timeout_as_failure(monkeypatch, idle_clock, tmp_path, capsys):
+    connection = ActivityConnection([1])
+    output = tmp_path / "idle.json"
+    monkeypatch.setattr("benchmarks.database.benchmark_connection", lambda: connection)
+    monkeypatch.setattr("sys.argv", ["database.py", "wait-idle", "--timeout", "0.1", "--output", str(output)])
+
+    assert main() == 1
+    result = json.loads(output.read_text())
+    assert result["status"] == "failed"
+    assert "1 client connection(s)" in result["errors"][0]
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf"])
+def test_wait_idle_cli_rejects_non_positive_or_non_finite_timeout(monkeypatch, timeout):
+    monkeypatch.setattr("sys.argv", ["database.py", "wait-idle", "--timeout", timeout])
+
+    with pytest.raises(SystemExit) as error:
+        main()
+
+    assert error.value.code == 2
+
+
+def test_wait_idle_rejects_development_database_before_connecting(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/return_flow")
+
+    def unsafe_connection(*args, **kwargs):
+        pytest.fail("The database safety guard must run before polling activity.")
+
+    monkeypatch.setattr("benchmarks.database.psycopg.connect", unsafe_connection)
+
+    with pytest.raises(ValueError, match="require database"):
+        wait_idle(1)

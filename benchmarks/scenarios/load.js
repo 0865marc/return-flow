@@ -34,6 +34,16 @@ const unknownWrites = new Counter('unknown_writes');
 const deliveries = new Counter('deliveries_created');
 const delivered = new Counter('deliveries_delivered');
 const returns = new Counter('returns_created');
+const httpRequests = {
+  total: new Counter('http_requests_total'),
+  succeeded: new Counter('http_requests_succeeded'),
+  failed: new Counter('http_requests_failed'),
+  responses4xx: new Counter('http_responses_4xx'),
+  responses5xx: new Counter('http_responses_5xx'),
+  transportErrors: new Counter('http_transport_errors'),
+  timeouts: new Counter('http_timeouts'),
+  unexpectedResponses: new Counter('http_unexpected_responses'),
+};
 const workflowDuration = new Trend('workflow_duration', true);
 const requestDurations = {
   'GET /deliveries/{id}': new Trend('get_delivery_duration', true),
@@ -76,6 +86,7 @@ function isId(value) {
 }
 
 function request(method, path, name, status, validBody, body = null) {
+  httpRequests.total.add(1, { name });
   const response = http.request(method, `${baseUrl}${path}`, body, {
     headers: { 'Content-Type': 'application/json' },
     tags: { name },
@@ -95,6 +106,23 @@ function request(method, path, name, status, validBody, body = null) {
   });
   if (!valid) {
     errors.add(1, { name });
+    httpRequests.failed.add(1, { name });
+    // Each failed request belongs to exactly one category. Timeouts are a
+    // subset of transport errors, so they must not be added to the total again.
+    if (response.status === 0) {
+      httpRequests.transportErrors.add(1, { name });
+      // k6 documents 1050 as request timeout and 1211 as connection dial timeout.
+      if (response.error_code === 1050 || response.error_code === 1211) {
+        httpRequests.timeouts.add(1, { name });
+      }
+    } else if (response.status >= 400 && response.status < 500) {
+      httpRequests.responses4xx.add(1, { name });
+    } else if (response.status >= 500 && response.status < 600) {
+      httpRequests.responses5xx.add(1, { name });
+    } else {
+      // Includes unexpected statuses and successful statuses with invalid bodies.
+      httpRequests.unexpectedResponses.add(1, { name });
+    }
     if (method !== 'GET' && (response.status === 0 || response.status >= 500
         || (response.status >= 200 && response.status < 300))) {
       // A timeout/5xx or unreadable success does not prove the write was rejected.
@@ -102,12 +130,14 @@ function request(method, path, name, status, validBody, body = null) {
     }
     return null;
   }
+  httpRequests.succeeded.add(1, { name });
   return payload;
 }
 
 export default function () {
   if (!metricsInitialized) {
-    [attempted, completed, errors, unknownWrites, deliveries, delivered, returns]
+    [attempted, completed, errors, unknownWrites, deliveries, delivered, returns,
+      ...Object.values(httpRequests)]
       .forEach((metric) => metric.add(0));
     metricsInitialized = true;
   }
@@ -165,6 +195,13 @@ export function handleSummary(data) {
       + ` completed; errors=${count('technical_errors')}`
       + ` unknown_writes=${count('unknown_writes')}`
       + ` dropped=${count('dropped_iterations')}`
+      + `; HTTP total=${count('http_requests_total')}`
+      + ` succeeded=${count('http_requests_succeeded')}`
+      + ` failed=${count('http_requests_failed')}`
+      + ` (4xx=${count('http_responses_4xx')}, 5xx=${count('http_responses_5xx')}`
+      + `, transport=${count('http_transport_errors')}`
+      + ` [timeouts=${count('http_timeouts')}]`
+      + `, unexpected=${count('http_unexpected_responses')})`
       + `; workflow ms p50=${latency['p(50)'] ?? 'n/a'}`
       + ` p95=${latency['p(95)'] ?? 'n/a'} p99=${latency['p(99)'] ?? 'n/a'}\n`,
   };

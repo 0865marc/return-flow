@@ -193,6 +193,26 @@ Para comprobar que funciona, desde la raíz del proyecto:
 python3 benchmarks/run.py --smoke
 ```
 
+Para comparar una conexión nueva por operación frente a reutilizar un pool:
+
+```bash
+python3 benchmarks/run.py --adapters postgres postgres_pool
+```
+
+Por defecto, compara el flujo completo a 10 y 50 flujos por segundo, con
+tres repeticiones por adaptador y carga: 12 mediciones en total.
+
 La prueba corta valida el evaluador; no sirve para sacar conclusiones de
-rendimiento. Consulta la [metodología y los comandos de evaluación](benchmarks/README.md)
+rendimiento. Los nuevos resultados incluyen `execution_model: "async"`; los
+resultados anteriores conservan su significado y no deben mezclarse solo porque
+coincidan los nombres de los adaptadores.
+
+La medición continúa aunque el calentamiento incumpla los umbrales de carga,
+para observar también qué ocurre bajo saturación. El informe separa peticiones
+HTTP fallidas, flujos incompletos y operaciones que k6 no llegó a iniciar; además,
+audita las escrituras confirmadas en PostgreSQL. Una petición fallida no demuestra
+por sí sola que se haya perdido una escritura. Si es necesario reiniciar la API
+para asegurar que no quedan operaciones pendientes, se registra en el resultado.
+
+Consulta la [metodología y los comandos de evaluación](benchmarks/README.md)
 para configurar escenarios, carga y repeticiones, y leer sus resultados.

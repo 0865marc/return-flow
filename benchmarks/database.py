@@ -3,7 +3,9 @@
 import argparse
 import json
 import os
+import time
 from collections import Counter
+from math import isfinite
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -37,6 +39,48 @@ def positive_int(value: str) -> int:
     if not 1 <= parsed <= 999_999_999_999:
         raise argparse.ArgumentTypeError("Expected a positive integer below 10^12.")
     return parsed
+
+
+def positive_timeout(value: str) -> float:
+    parsed = float(value)
+    if not isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("Expected a finite timeout greater than zero.")
+    return parsed
+
+
+def wait_idle(timeout: float) -> dict[str, Any]:
+    """Wait for stopped benchmark clients to disconnect before auditing or reseeding."""
+    if not isfinite(timeout) or timeout <= 0:
+        raise ValueError("Expected a finite timeout greater than zero.")
+    started = time.monotonic()
+    deadline = started + timeout
+    with benchmark_connection() as connection:
+        # Each poll needs a fresh pg_stat_activity snapshot, outside a long transaction.
+        connection.autocommit = True
+        while True:
+            row = connection.execute(
+                """
+                SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND backend_type = 'client backend'
+                  AND pid <> pg_backend_pid()
+                """
+            ).fetchone()
+            assert row is not None
+            remaining = row[0]
+            now = time.monotonic()
+            if remaining == 0:
+                return {
+                    "status": "passed",
+                    "remaining_connections": 0,
+                    "waited_seconds": round(now - started, 3),
+                }
+            if now >= deadline:
+                raise TimeoutError(
+                    f"Benchmark database still has {remaining} client connection(s) "
+                    f"after {timeout:g} seconds; audit and reseeding are unsafe."
+                )
+            time.sleep(min(0.2, deadline - now))
 
 
 def seed(size: int) -> dict[str, Any]:
@@ -222,6 +266,9 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("seed")
     prepare.add_argument("--size", type=positive_int, default=1000)
+    idle = commands.add_parser("wait-idle")
+    idle.add_argument("--timeout", type=positive_timeout, default=30.0)
+    idle.add_argument("--output", type=Path)
     check = commands.add_parser("verify")
     check.add_argument("--size", type=positive_int, default=1000)
     check.add_argument("--scenario", choices=("read", "create", "flow"), required=True)
@@ -230,7 +277,12 @@ def main() -> int:
     check.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
-        result = seed(args.size) if args.command == "seed" else verify(args)
+        if args.command == "seed":
+            result = seed(args.size)
+        elif args.command == "wait-idle":
+            result = wait_idle(args.timeout)
+        else:
+            result = verify(args)
     except (OSError, ValueError, psycopg.Error) as exc:
         result = {"status": "failed", "errors": [str(exc)]}
     write_result(result, getattr(args, "output", None))
