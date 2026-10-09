@@ -1,8 +1,9 @@
 ﻿# Return-Flow
 
 Simulación práctica de un sistema de entregas y devoluciones con Python y FastAPI,
-PostgreSQL y RabbitMQ. El proyecto utiliza arquitectura hexagonal y eventos
-asíncronos, con un entorno de desarrollo local basado en Docker Compose.
+PostgreSQL y RabbitMQ. El proyecto utiliza arquitectura hexagonal y acceso
+asíncrono a PostgreSQL, con un entorno de desarrollo local basado en Docker Compose.
+La integración de eventos con RabbitMQ queda para un experimento posterior.
 
 ## Desarrollo local
 
@@ -34,38 +35,48 @@ Para detener los servicios: `docker compose down`. Los datos se conservan en vol
 ## Persistencia PostgreSQL
 
 La API utiliza por defecto `adapters/persistence/postgres_pool.py`: un adaptador
-síncrono con psycopg que reutiliza conexiones. Los repositorios de entregas y
+asíncrono con psycopg que reutiliza conexiones. Los repositorios de entregas y
 devoluciones comparten un pool por proceso de la API. Se abre al arrancar y se
 cierra al detener la aplicación; cada operación termina su transacción y devuelve
 la conexión al pool.
 
-El adaptador original, `adapters/persistence/postgres.py`, conserva una conexión
-nueva por operación. Ambos cumplen los mismos puertos y se pueden seleccionar
-para compararlos sin cambiar los casos de uso ni el dominio:
+La alternativa, `adapters/persistence/postgres.py`, abre una conexión asíncrona
+nueva por operación y la cierra al terminar. Ambos adaptadores cumplen los mismos
+puertos y utilizan las mismas rutas y casos de uso con `async/await`.
 
 ```bash
 PERSISTENCE_ADAPTER=postgres_pool docker compose up -d --build api
-PERSISTENCE_ADAPTER=postgres docker compose up -d api
+PERSISTENCE_ADAPTER=postgres docker compose up -d --build api
 ```
 
 Ejecuta uno de los comandos según la variante que quieras utilizar.
 
 | Variable | Valor por defecto | Función |
 |---|---|---|
-| `PERSISTENCE_ADAPTER` | `postgres_pool` | Selecciona `postgres_pool` o `postgres`. |
+| `PERSISTENCE_ADAPTER` | `postgres_pool` | Selecciona `postgres` o `postgres_pool`. |
 | `DATABASE_POOL_MAX_SIZE` | `10` | Máximo de conexiones del pool por proceso. |
 | `DATABASE_POOL_TIMEOUT` | `5` | Segundos de espera máxima para obtener una conexión. |
 
 El pool mantiene al menos una conexión. Si todas están ocupadas, la operación
 espera una disponible; si supera el tiempo de espera, la API responde `503`.
-Las variables del pool solo se aplican a `postgres_pool`. Los dos adaptadores
-ejecutan SQL directamente, sin ORM.
+Las variables del pool se aplican solo a `postgres_pool`.
+Las dos variantes ejecutan el mismo SQL directamente, sin ORM, y responden
+después de persistir la operación.
 
 Cada adaptador expone `open_repositories()`, que prepara sus repositorios y libera
-sus recursos al terminar. `composition.py` elige la variante configurada y llama a
-esa función. `main.py` recibe los repositorios preparados y los conecta con FastAPI.
-Para añadir otra variante síncrona, se implementa su función de inicialización y
-se registra en `PERSISTENCE_FACTORIES`, sin añadir condiciones a `main.py`.
+sus recursos al terminar. Al crear la aplicación, `composition.py` selecciona
+la fábrica en `PERSISTENCE_FACTORIES`. `main.py` registra el único router HTTP
+y gestiona el ciclo de vida del adaptador seleccionado.
+
+| Variante | Conexiones PostgreSQL |
+|---|---|
+| `postgres` | Abre y cierra una conexión asíncrona por operación. |
+| `postgres_pool` | Obtiene y devuelve una conexión de `AsyncConnectionPool`. |
+
+Las rutas esperan a los casos de uso y estos esperan a los repositorios mediante
+`await`. El dominio conserva métodos normales: aplicar una regla de negocio no
+necesita esperar a la red. `async/await` permite atender otras peticiones mientras
+PostgreSQL responde; la respuesta HTTP sigue confirmando una operación terminada.
 
 ## Arquitectura de la API
 
@@ -83,8 +94,8 @@ Cada parte tiene una responsabilidad:
 - **Adaptadores:** conectan la aplicación con herramientas concretas. FastAPI
   recibe peticiones; PostgreSQL guarda datos; RabbitMQ transporta mensajes.
 - **`main.py`:** arranca FastAPI y conecta los repositorios con las rutas.
-- **`composition.py`:** selecciona el adaptador de persistencia; cada adaptador
-  gestiona su propia inicialización y cierre.
+- **`composition.py`:** selecciona los repositorios de la variante elegida;
+  cada adaptador de persistencia gestiona su inicialización y cierre.
 
 Por ejemplo, una petición llega a FastAPI, que llama a un caso de uso. Este aplica
 las reglas del dominio y, si necesita guardar datos, utiliza un puerto. El
@@ -163,14 +174,15 @@ docker compose exec api sh -c 'TEST_DATABASE_URL="$DATABASE_URL" python -m pytes
 Estas pruebas crean un esquema temporal por prueba y lo eliminan al terminar,
 sin modificar las tablas de la aplicación. Se omiten cuando no está definida
 `TEST_DATABASE_URL`. Las pruebas de persistencia y end-to-end se ejecutan para
-ambos adaptadores. Las end-to-end utilizan la aplicación real mediante
+las dos variantes. Las end-to-end utilizan la aplicación real mediante
 `TestClient` y comprueban que la devolución sigue disponible al reiniciar la API.
 También se comprueban la reutilización de conexiones, el rollback tras errores,
 el agotamiento del pool y su cierre al detener la aplicación.
+Las pruebas asíncronas utilizan el soporte de AnyIO con el backend `asyncio`.
 
 ## Evaluación de rendimiento y fiabilidad
 
-El evaluador de `benchmarks/` compara los adaptadores `postgres` y `postgres_pool`
+El evaluador de `benchmarks/` compara `postgres` y `postgres_pool`, ambos asíncronos,
 con la misma API. Un script de Python arranca un entorno Docker aislado, ejecuta
 carga HTTP con k6, comprueba los datos persistidos y guarda los resultados en
 archivos locales. No requiere Grafana ni utiliza los datos de desarrollo.

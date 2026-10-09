@@ -9,6 +9,11 @@ from psycopg.conninfo import make_conninfo
 
 
 @pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture
 def postgres_url() -> Iterator[str]:
     base_url = os.environ.get("TEST_DATABASE_URL")
     if not base_url:
