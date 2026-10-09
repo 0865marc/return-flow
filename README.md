@@ -199,8 +199,8 @@ Para comparar una conexión nueva por operación frente a reutilizar un pool:
 python3 benchmarks/run.py --adapters postgres postgres_pool
 ```
 
-Por defecto, compara el flujo completo a 10 y 50 flujos por segundo, con
-tres repeticiones por adaptador y carga: 12 mediciones en total.
+Por defecto, compara el flujo completo a 10, 50 y 400 flujos por segundo, con
+tres repeticiones por adaptador y carga: 18 mediciones en total.
 
 La prueba corta valida el evaluador; no sirve para sacar conclusiones de
 rendimiento. Los nuevos resultados incluyen `execution_model: "async"`; los

@@ -47,7 +47,7 @@ def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adapters", nargs="+", choices=ADAPTERS, default=list(ADAPTERS))
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["flow"])
-    parser.add_argument("--rates", nargs="+", type=positive_int, default=[10, 50], help="iterations per second")
+    parser.add_argument("--rates", nargs="+", type=positive_int, default=[10, 50, 400], help="iterations per second")
     parser.add_argument("--duration", type=positive_int, default=30, help="measurement seconds")
     parser.add_argument("--warmup", type=positive_int, default=5, help="warmup seconds, recorded separately")
     parser.add_argument("--repetitions", type=positive_int, default=3)

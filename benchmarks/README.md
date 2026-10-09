@@ -63,8 +63,8 @@ Después, ejecuta la comparación predeterminada del flujo completo:
 python3 benchmarks/run.py
 ```
 
-Evalúa `flow` con los dos adaptadores, a 10 y 50 operaciones por segundo, con
-5 segundos de calentamiento, 30 de medición y tres repeticiones. Son 12
+Evalúa `flow` con los dos adaptadores, a 10, 50 y 400 operaciones por segundo, con
+5 segundos de calentamiento, 30 de medición y tres repeticiones. Son 18
 mediciones previstas. También se miden las configuraciones que incumplan los
 umbrales durante el calentamiento. Abre el `report.md` de la carpeta de resultados
 que imprime el script para comparar cada repetición.
@@ -74,7 +74,7 @@ La selección explícita equivalente es:
 ```bash
 python3 benchmarks/run.py \
   --adapters postgres postgres_pool \
-  --rates 10 50 \
+  --rates 10 50 400 \
   --warmup 5 \
   --duration 30 \
   --repetitions 3
@@ -106,7 +106,7 @@ calentamientos: reserva tiempo suficiente.
 |---|---|---|
 | `--adapters` | `postgres postgres_pool` | Adaptadores asíncronos que se comparan. |
 | `--scenarios` | `flow` | Escenarios; admite `read`, `create` y `flow`. |
-| `--rates` | `10 50` | Operaciones iniciadas por segundo, no peticiones HTTP. |
+| `--rates` | `10 50 400` | Operaciones iniciadas por segundo, no peticiones HTTP. |
 | `--duration` | `30` | Segundos de medición por ejecución. |
 | `--warmup` | `5` | Segundos de calentamiento antes de medir. |
 | `--repetitions` | `3` | Repeticiones de cada combinación. |
