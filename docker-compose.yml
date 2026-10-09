@@ -9,8 +9,8 @@ services:
       DATABASE_URL: postgresql://return_flow:return_flow@postgres:5432/return_flow
       RABBITMQ_URL: amqp://return_flow:return_flow@rabbitmq:5672/
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: postgres:17-alpine
@@ -22,6 +22,11 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
   rabbitmq:
     image: rabbitmq:4-alpine
