@@ -167,3 +167,20 @@ ambos adaptadores. Las end-to-end utilizan la aplicación real mediante
 `TestClient` y comprueban que la devolución sigue disponible al reiniciar la API.
 También se comprueban la reutilización de conexiones, el rollback tras errores,
 el agotamiento del pool y su cierre al detener la aplicación.
+
+## Evaluación de rendimiento y fiabilidad
+
+El evaluador de `benchmarks/` compara los adaptadores `postgres` y `postgres_pool`
+con la misma API. Un script de Python arranca un entorno Docker aislado, ejecuta
+carga HTTP con k6, comprueba los datos persistidos y guarda los resultados en
+archivos locales. No requiere Grafana ni utiliza los datos de desarrollo.
+
+Para comprobar que funciona, desde la raíz del proyecto:
+
+```bash
+python3 benchmarks/run.py --smoke
+```
+
+La prueba corta valida el evaluador; no sirve para sacar conclusiones de
+rendimiento. Consulta la [metodología y los comandos de evaluación](benchmarks/README.md)
+para configurar escenarios, carga y repeticiones, y leer sus resultados.
