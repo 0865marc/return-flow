@@ -31,6 +31,14 @@ eventos en una siguiente iteración.
 
 Para detener los servicios: `docker compose down`. Los datos se conservan en volúmenes; `docker compose down -v` también los elimina.
 
+## Persistencia PostgreSQL
+
+Cada adaptador expone `open_repositories()`, que prepara sus repositorios y libera
+sus recursos al terminar. `composition.py` elige la variante configurada y llama a
+esa función. `main.py` recibe los repositorios preparados y los conecta con FastAPI.
+Para añadir otra variante síncrona, se implementa su función de inicialización y
+se registra en `PERSISTENCE_FACTORIES`, sin añadir condiciones a `main.py`.
+
 ## Arquitectura de la API
 
 La arquitectura hexagonal separa las reglas del negocio de las herramientas que
@@ -46,7 +54,9 @@ Cada parte tiene una responsabilidad:
   del exterior, por ejemplo buscar o guardar una entrega.
 - **Adaptadores:** conectan la aplicación con herramientas concretas. FastAPI
   recibe peticiones; PostgreSQL guarda datos; RabbitMQ transporta mensajes.
-- **`main.py`:** arranca la API y conecta las piezas.
+- **`main.py`:** arranca FastAPI y conecta los repositorios con las rutas.
+- **`composition.py`:** selecciona el adaptador de persistencia; cada adaptador
+  gestiona su propia inicialización y cierre.
 
 Por ejemplo, una petición llega a FastAPI, que llama a un caso de uso. Este aplica
 las reglas del dominio y, si necesita guardar datos, utiliza un puerto. El
@@ -61,6 +71,7 @@ integración de eventos.
 ```text
 api/
 ├── main.py
+├── composition.py
 ├── domain/
 ├── application/
 │   ├── use_cases/

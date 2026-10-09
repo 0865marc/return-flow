@@ -1,8 +1,11 @@
+from collections.abc import Generator
+from contextlib import contextmanager
 from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
 
+from adapters.persistence import Repositories
 from application.errors import ConcurrentModificationError, EntityNotFoundError
 from application.ports.repositories import DeliveryRepository, ReturnRepository
 from domain.delivery import Delivery, DeliveryStatus
@@ -45,10 +48,8 @@ class PostgresDeliveryRepository(DeliveryRepository):
                 )
 
     def get(self, delivery_id: UUID) -> Delivery | None:
-        with psycopg.connect(
-            self.database_url, connect_timeout=5, row_factory=dict_row
-        ) as connection:
-            with connection.cursor() as cursor:
+        with psycopg.connect(self.database_url, connect_timeout=5) as connection:
+            with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     "SELECT id, status FROM deliveries WHERE id = %s",
                     (delivery_id,),
@@ -91,13 +92,21 @@ class PostgresReturnRepository(ReturnRepository):
                 )
 
     def get(self, return_id: UUID) -> Return | None:
-        with psycopg.connect(
-            self.database_url, connect_timeout=5, row_factory=dict_row
-        ) as connection:
-            with connection.cursor() as cursor:
+        with psycopg.connect(self.database_url, connect_timeout=5) as connection:
+            with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     "SELECT id, delivery_id, status FROM returns WHERE id = %s",
                     (return_id,),
                 )
                 row = cursor.fetchone()
                 return Return.model_validate(row) if row is not None else None
+
+
+@contextmanager
+def open_repositories(database_url: str) -> Generator[Repositories]:
+    """Initialize PostgreSQL and provide repositories for the application's lifetime."""
+    initialize_database(database_url)
+    yield Repositories(
+        deliveries=PostgresDeliveryRepository(database_url),
+        returns=PostgresReturnRepository(database_url),
+    )
