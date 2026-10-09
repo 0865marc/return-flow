@@ -33,6 +33,34 @@ Para detener los servicios: `docker compose down`. Los datos se conservan en vol
 
 ## Persistencia PostgreSQL
 
+La API utiliza por defecto `adapters/persistence/postgres_pool.py`: un adaptador
+síncrono con psycopg que reutiliza conexiones. Los repositorios de entregas y
+devoluciones comparten un pool por proceso de la API. Se abre al arrancar y se
+cierra al detener la aplicación; cada operación termina su transacción y devuelve
+la conexión al pool.
+
+El adaptador original, `adapters/persistence/postgres.py`, conserva una conexión
+nueva por operación. Ambos cumplen los mismos puertos y se pueden seleccionar
+para compararlos sin cambiar los casos de uso ni el dominio:
+
+```bash
+PERSISTENCE_ADAPTER=postgres_pool docker compose up -d --build api
+PERSISTENCE_ADAPTER=postgres docker compose up -d api
+```
+
+Ejecuta uno de los comandos según la variante que quieras utilizar.
+
+| Variable | Valor por defecto | Función |
+|---|---|---|
+| `PERSISTENCE_ADAPTER` | `postgres_pool` | Selecciona `postgres_pool` o `postgres`. |
+| `DATABASE_POOL_MAX_SIZE` | `10` | Máximo de conexiones del pool por proceso. |
+| `DATABASE_POOL_TIMEOUT` | `5` | Segundos de espera máxima para obtener una conexión. |
+
+El pool mantiene al menos una conexión. Si todas están ocupadas, la operación
+espera una disponible; si supera el tiempo de espera, la API responde `503`.
+Las variables del pool solo se aplican a `postgres_pool`. Los dos adaptadores
+ejecutan SQL directamente, sin ORM.
+
 Cada adaptador expone `open_repositories()`, que prepara sus repositorios y libera
 sus recursos al terminar. `composition.py` elige la variante configurada y llama a
 esa función. `main.py` recibe los repositorios preparados y los conecta con FastAPI.
@@ -134,5 +162,8 @@ docker compose exec api sh -c 'TEST_DATABASE_URL="$DATABASE_URL" python -m pytes
 
 Estas pruebas crean un esquema temporal por prueba y lo eliminan al terminar,
 sin modificar las tablas de la aplicación. Se omiten cuando no está definida
-`TEST_DATABASE_URL`. La prueba end-to-end utiliza la aplicación real mediante
-`TestClient` y comprueba que la devolución sigue disponible al reiniciar la API.
+`TEST_DATABASE_URL`. Las pruebas de persistencia y end-to-end se ejecutan para
+ambos adaptadores. Las end-to-end utilizan la aplicación real mediante
+`TestClient` y comprueban que la devolución sigue disponible al reiniciar la API.
+También se comprueban la reutilización de conexiones, el rollback tras errores,
+el agotamiento del pool y su cierre al detener la aplicación.

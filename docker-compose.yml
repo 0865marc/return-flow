@@ -7,6 +7,9 @@ services:
       - ./api:/api
     environment:
       DATABASE_URL: postgresql://return_flow:return_flow@postgres:5432/return_flow
+      PERSISTENCE_ADAPTER: ${PERSISTENCE_ADAPTER:-postgres_pool}
+      DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-10}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-5}
       RABBITMQ_URL: amqp://return_flow:return_flow@rabbitmq:5672/
     depends_on:
       postgres:

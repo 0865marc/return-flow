@@ -4,12 +4,13 @@ from contextlib import AbstractContextManager, asynccontextmanager
 
 from fastapi.concurrency import contextmanager_in_threadpool
 
-from adapters.persistence import Repositories, postgres
+from adapters.persistence import Repositories, postgres, postgres_pool
 
 PERSISTENCE_FACTORIES: dict[
     str, Callable[[str], AbstractContextManager[Repositories]]
 ] = {
     "postgres": postgres.open_repositories,
+    "postgres_pool": postgres_pool.open_repositories,
 }
 
 
@@ -24,7 +25,7 @@ async def open_persistence(
     adapter = (
         persistence_adapter
         if persistence_adapter is not None
-        else os.environ.get("PERSISTENCE_ADAPTER", "postgres")
+        else os.environ.get("PERSISTENCE_ADAPTER", "postgres_pool")
     )
     factory = PERSISTENCE_FACTORIES.get(adapter)
     if factory is None:
