@@ -22,9 +22,12 @@ La API está disponible en `http://localhost:8000`, con documentación interacti
 El código, el Dockerfile y las dependencias de FastAPI están en `api/`.
 Los cambios en el código de `api/` recargan automáticamente el servidor.
 
-El servicio `api` recibe `DATABASE_URL` y `RABBITMQ_URL` con los nombres internos de
-los servicios. La conexión a PostgreSQL y RabbitMQ se implementará con la lógica de
-la aplicación; `/health` solo comprueba que la API responde.
+El servicio `api` usa `DATABASE_URL` para conectar con PostgreSQL. Compose espera
+a que la base de datos esté disponible y la API crea las tablas que falten al
+arrancar. Los datos existentes se conservan. `/health` comprueba que la API responde.
+
+El primer flujo utiliza HTTP y PostgreSQL. RabbitMQ queda preparado para incorporar
+eventos en una siguiente iteración.
 
 Para detener los servicios: `docker compose down`. Los datos se conservan en volúmenes; `docker compose down -v` también los elimina.
 
@@ -52,8 +55,8 @@ adaptador de PostgreSQL implementa ese contrato y realiza la operación.
 La regla de organización es que el dominio no necesita conocer HTTP, SQL ni
 RabbitMQ, y los casos de uso conocen los contratos, no sus implementaciones.
 
-Esta es la estructura prevista. Actualmente están implementados el dominio y el
-arranque de FastAPI; `application/` y `adapters/` se añadirán conforme avancemos.
+Esta es la estructura de la API. `adapters/messaging/` queda pendiente para la
+integración de eventos.
 
 ```text
 api/
@@ -68,6 +71,30 @@ api/
     └── messaging/
 ```
 
+## Primer flujo: solicitar una devolución
+
+El recorrido completo conecta FastAPI, los casos de uso, los dominios y PostgreSQL.
+Por ejemplo, `POST /returns` llama a `RequestReturn`, que obtiene la entrega y guarda
+la devolución mediante los puertos de repositorio. Los adaptadores de PostgreSQL
+implementan esos puertos.
+
+Puedes probarlo desde `http://localhost:8000/docs`, en este orden:
+
+1. `POST /deliveries`: crea una entrega pendiente. Copia el `id` de la respuesta.
+2. `POST /deliveries/{delivery_id}/deliver`: marca esa entrega como entregada.
+3. `POST /returns`: solicita su devolución con este cuerpo:
+
+   ```json
+   {"delivery_id": "UUID_DE_LA_ENTREGA"}
+   ```
+
+4. `GET /returns/{return_id}`: consulta la devolución usando el `id` recibido.
+   También puedes consultar la entrega con `GET /deliveries/{delivery_id}`.
+
+Las creaciones devuelven `201` y las consultas y actualizaciones, `200`. Un recurso
+inexistente devuelve `404`; una operación no permitida por el negocio, `409`; y
+una entrada inválida, `422`. Los datos permanecen disponibles al reiniciar la API.
+
 ## Testing
 
 Las pruebas usan `pytest` y siguen la misma organización que el código de la API:
@@ -76,12 +103,25 @@ Las pruebas usan `pytest` y siguen la misma organización que el código de la A
 api/tests/
 ├── domain/
 ├── application/
-└── adapters/
+├── adapters/
+└── e2e/
 ```
 
-Para ejecutarlas en Docker, desde la raíz del proyecto:
+Las pruebas de dominio, casos de uso y HTTP con repositorios en memoria se ejecutan
+sin una base de datos de pruebas. Desde la raíz del proyecto:
 
 ```bash
 docker compose up -d --build api
 docker compose exec api python -m pytest
 ```
+
+Para ejecutar también persistencia y el flujo end-to-end contra PostgreSQL:
+
+```bash
+docker compose exec api sh -c 'TEST_DATABASE_URL="$DATABASE_URL" python -m pytest'
+```
+
+Estas pruebas crean un esquema temporal por prueba y lo eliminan al terminar,
+sin modificar las tablas de la aplicación. Se omiten cuando no está definida
+`TEST_DATABASE_URL`. La prueba end-to-end utiliza la aplicación real mediante
+`TestClient` y comprueba que la devolución sigue disponible al reiniciar la API.
