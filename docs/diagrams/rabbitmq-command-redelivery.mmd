@@ -1,0 +1,40 @@
+sequenceDiagram
+    participant Q as RabbitMQ
+    participant A as Worker A
+    participant DB as PostgreSQL
+    participant B as Worker B
+
+    %% Diseño propuesto: el registro transaccional de comandos aún no está implementado.
+    %% Ejemplo: el primer worker comienza a crear una devolución y se cae sin enviar ACK.
+    Q->>A: Entregar comando: crear devolución + command_id
+    Note over Q,A: command_id identifica la solicitud y se conserva al reintentar
+    A->>DB: BEGIN: iniciar transacción
+    A->>DB: Registrar command_id con clave única
+    A->>DB: Crear devolución y guardar resultado del comando
+    alt Caída antes del COMMIT: cambios sin confirmar
+        A->>A: Caída sin enviar ACK
+        DB->>DB: ROLLBACK: deshacer devolución y registro
+    else Caída después del COMMIT: cambios confirmados
+        A->>DB: COMMIT: confirmar devolución y resultado
+        DB-->>A: Transacción confirmada
+        A->>A: Caída sin enviar ACK
+    end
+
+    Q->>Q: Detectar cierre del canal o conexión del Worker A
+    Q->>Q: Reencolar el mensaje pendiente de ACK
+    Q->>B: Reentregar el comando con el mismo command_id
+    B->>DB: BEGIN: iniciar transacción
+    B->>DB: Intentar registrar command_id con clave única
+    alt Cambios revertidos: crear devolución
+        DB-->>B: Registro creado: ejecutar comando
+        B->>B: Ejecutar caso de uso de devolución
+        B->>DB: Crear devolución
+        B->>DB: Guardar comando completado + ID de la devolución
+    else Cambios confirmados: recuperar resultado
+        DB-->>B: Devolver ID de la devolución ya creada
+        B->>B: Reutilizar la devolución existente
+    end
+    B->>DB: COMMIT: confirmar transacción
+    DB-->>B: Transacción confirmada
+    B->>Q: ACK: procesamiento confirmado
+    Q->>Q: Retirar este mensaje de la cola
