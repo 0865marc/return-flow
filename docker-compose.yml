@@ -11,8 +11,33 @@ services:
       DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-10}
       DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-5}
       RABBITMQ_URL: amqp://return_flow:return_flow@rabbitmq:5672/
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-return_flow.deliveries.commands}
+      RABBITMQ_CONNECT_TIMEOUT: ${RABBITMQ_CONNECT_TIMEOUT:-5}
+      RABBITMQ_PUBLISH_TIMEOUT: ${RABBITMQ_PUBLISH_TIMEOUT:-5}
     depends_on:
       postgres:
+        condition: service_healthy
+
+  worker:
+    build: ./api
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./api:/api
+    environment:
+      DATABASE_URL: postgresql://return_flow:return_flow@postgres:5432/return_flow
+      PERSISTENCE_ADAPTER: ${PERSISTENCE_ADAPTER:-postgres_pool}
+      DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-10}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-5}
+      RABBITMQ_URL: amqp://return_flow:return_flow@rabbitmq:5672/
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-return_flow.deliveries.commands}
+      RABBITMQ_CONNECT_TIMEOUT: ${RABBITMQ_CONNECT_TIMEOUT:-5}
+      RABBITMQ_PUBLISH_TIMEOUT: ${RABBITMQ_PUBLISH_TIMEOUT:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   postgres:
@@ -41,6 +66,12 @@ services:
       - "127.0.0.1:5672:5672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 volumes:
   postgres_data:
