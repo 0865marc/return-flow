@@ -1,7 +1,9 @@
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from adapters.messaging.contracts import CommandType
 from domain.delivery import DeliveryStatus
 from domain.returns import ReturnStatus
 
@@ -11,6 +13,21 @@ class DeliveryResponse(BaseModel):
 
     id: UUID
     status: DeliveryStatus
+
+
+class CommandAcceptedResponse(BaseModel):
+    command_id: UUID
+    status: Literal["accepted"] = "accepted"
+
+
+class CommandResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    command_id: UUID
+    type: CommandType
+    status: Literal["pending", "completed", "failed"]
+    result: dict[str, str] | None = None
+    error: str | None = None
 
 
 class RequestReturnBody(BaseModel):

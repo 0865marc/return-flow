@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from adapters.http import register_exception_handlers, router
-from composition import get_persistence_factory, open_persistence
+from composition import get_persistence_factory, open_persistence, open_publisher
 
 
 def create_app(
@@ -14,9 +14,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
-        async with open_persistence(database_url, factory=factory) as repositories:
+        async with (
+            open_persistence(database_url, factory=factory) as repositories,
+            open_publisher() as publisher,
+        ):
             application.state.delivery_repository = repositories.deliveries
             application.state.return_repository = repositories.returns
+            application.state.command_store = repositories.commands
+            application.state.command_publisher = publisher
             yield
 
     application = FastAPI(title="Return-Flow", lifespan=lifespan)
