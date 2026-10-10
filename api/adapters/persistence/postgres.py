@@ -19,18 +19,36 @@ async def initialize_database(database_url: str) -> None:
         database_url, connect_timeout=5
     ) as connection:
         async with connection.cursor() as cursor:
+            # API and workers can bootstrap the same schema concurrently. IF NOT
+            # EXISTS alone does not prevent races in PostgreSQL's system catalog.
+            await cursor.execute(
+                "SELECT pg_advisory_xact_lock("
+                "hashtext('return_flow.schema'), hashtext(current_schema()))"
+            )
             for statement in SCHEMA_STATEMENTS:
                 await cursor.execute(statement)
 
 
 class PostgresDeliveryRepository(DeliveryRepository):
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self, database_url: str, *, connection: AsyncConnection | None = None
+    ) -> None:
         self.database_url = database_url
+        self.connection = connection
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncGenerator[AsyncConnection]:
+        if self.connection is not None:
+            # The command store owns this connection and its transaction.
+            yield self.connection
+        else:
+            async with await AsyncConnection.connect(
+                self.database_url, connect_timeout=5
+            ) as connection:
+                yield connection
 
     async def add(self, delivery: Delivery) -> None:
-        async with await AsyncConnection.connect(
-            self.database_url, connect_timeout=5
-        ) as connection:
+        async with self._connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     "INSERT INTO deliveries (id, status) VALUES (%s, %s)",
@@ -38,9 +56,7 @@ class PostgresDeliveryRepository(DeliveryRepository):
                 )
 
     async def get(self, delivery_id: UUID) -> Delivery | None:
-        async with await AsyncConnection.connect(
-            self.database_url, connect_timeout=5
-        ) as connection:
+        async with self._connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     "SELECT id, status FROM deliveries WHERE id = %s",
@@ -50,9 +66,7 @@ class PostgresDeliveryRepository(DeliveryRepository):
                 return Delivery.model_validate(row) if row is not None else None
 
     async def save(self, delivery: Delivery, *, expected_status: DeliveryStatus) -> None:
-        async with await AsyncConnection.connect(
-            self.database_url, connect_timeout=5
-        ) as connection:
+        async with self._connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     "UPDATE deliveries SET status = %s WHERE id = %s AND status = %s",
@@ -70,13 +84,24 @@ class PostgresDeliveryRepository(DeliveryRepository):
 
 
 class PostgresReturnRepository(ReturnRepository):
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self, database_url: str, *, connection: AsyncConnection | None = None
+    ) -> None:
         self.database_url = database_url
+        self.connection = connection
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncGenerator[AsyncConnection]:
+        if self.connection is not None:
+            yield self.connection
+        else:
+            async with await AsyncConnection.connect(
+                self.database_url, connect_timeout=5
+            ) as connection:
+                yield connection
 
     async def add(self, returned: Return) -> None:
-        async with await AsyncConnection.connect(
-            self.database_url, connect_timeout=5
-        ) as connection:
+        async with self._connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
                     "INSERT INTO returns (id, delivery_id, status) VALUES (%s, %s, %s)",
@@ -88,9 +113,7 @@ class PostgresReturnRepository(ReturnRepository):
                 )
 
     async def get(self, return_id: UUID) -> Return | None:
-        async with await AsyncConnection.connect(
-            self.database_url, connect_timeout=5
-        ) as connection:
+        async with self._connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     "SELECT id, delivery_id, status FROM returns WHERE id = %s",
@@ -104,7 +127,17 @@ class PostgresReturnRepository(ReturnRepository):
 async def open_repositories(database_url: str) -> AsyncGenerator[Repositories]:
     """Initialize PostgreSQL; each repository operation opens its own connection."""
     await initialize_database(database_url)
+    from adapters.persistence.commands import PostgresCommandStore
+
+    @asynccontextmanager
+    async def open_connection() -> AsyncGenerator[AsyncConnection]:
+        async with await AsyncConnection.connect(
+            database_url, connect_timeout=5
+        ) as connection:
+            yield connection
+
     yield Repositories(
         deliveries=PostgresDeliveryRepository(database_url),
         returns=PostgresReturnRepository(database_url),
+        commands=PostgresCommandStore(open_connection),
     )

@@ -1,3 +1,4 @@
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -15,6 +16,14 @@ from domain.delivery import Delivery, DeliveryStatus
 from domain.returns import Return
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
+
+
+async def test_concurrent_api_and_worker_initialization_is_safe(postgres_url) -> None:
+    await asyncio.gather(*(initialize_database(postgres_url) for _ in range(8)))
+    repository = PostgresDeliveryRepository(postgres_url)
+    delivery = Delivery()
+    await repository.add(delivery)
+    assert await repository.get(delivery.id) == delivery
 
 
 async def test_delivery_can_be_created_loaded_and_updated(repositories) -> None:

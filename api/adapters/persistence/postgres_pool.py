@@ -82,6 +82,8 @@ class PooledPostgresReturnRepository(ReturnRepository):
 @asynccontextmanager
 async def open_repositories(database_url: str) -> AsyncGenerator[Repositories]:
     """Own the shared asynchronous pool until the application stops."""
+    from adapters.persistence.commands import PostgresCommandStore
+
     max_size = int(os.environ.get("DATABASE_POOL_MAX_SIZE", "10"))
     timeout = float(os.environ.get("DATABASE_POOL_TIMEOUT", "5"))
     if max_size < 1:
@@ -104,6 +106,7 @@ async def open_repositories(database_url: str) -> AsyncGenerator[Repositories]:
         yield Repositories(
             deliveries=PooledPostgresDeliveryRepository(pool),
             returns=PooledPostgresReturnRepository(pool),
+            commands=PostgresCommandStore(pool.connection),
         )
     finally:
         await pool.close()
