@@ -20,12 +20,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
 async def test_repositories_reuse_connection_and_commit_writes(
-    database_url: str, database_pool,
+    database_url: str, database_pool, postgres_autocommit: bool,
 ) -> None:
     deliveries = PostgresDeliveryRepository(database_pool)
     returns = PostgresReturnRepository(database_pool)
     async with database_pool.connection() as connection:
         original_backend = connection.info.backend_pid
+        assert connection.autocommit is postgres_autocommit
 
     delivery = Delivery()
     await deliveries.add(delivery)
@@ -91,12 +92,14 @@ async def test_exhausted_pool_times_out_and_recovers(database_pool) -> None:
 
 
 async def test_repository_context_closes_shared_pool_when_operation_fails(
-    postgres_url: str,
+    postgres_url: str, postgres_autocommit: bool,
 ) -> None:
     pool = None
     connection = None
     with pytest.raises(RuntimeError, match="Operation failed"):
-        async with open_repositories(postgres_url) as repositories:
+        async with open_repositories(
+            postgres_url, autocommit=postgres_autocommit
+        ) as repositories:
             assert isinstance(
                 repositories.deliveries, PostgresDeliveryRepository
             )
@@ -106,6 +109,7 @@ async def test_repository_context_closes_shared_pool_when_operation_fails(
             assert repositories.returns.pool is pool
             async with pool.connection() as connection:
                 assert not connection.closed
+                assert connection.autocommit is postgres_autocommit
 
             raise RuntimeError("Operation failed")
 
@@ -114,7 +118,7 @@ async def test_repository_context_closes_shared_pool_when_operation_fails(
 
 
 async def test_repository_context_closes_pool_when_startup_fails(
-    postgres_url: str, monkeypatch: pytest.MonkeyPatch,
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch, postgres_autocommit: bool,
 ) -> None:
     pools: list[AsyncConnectionPool[AsyncConnection[TupleRow]]] = []
     connections: list[AsyncConnection[TupleRow]] = []
@@ -134,7 +138,7 @@ async def test_repository_context_closes_pool_when_startup_fails(
     monkeypatch.setattr(postgres.AsyncConnectionPool, "open", fail_after_open)
 
     with pytest.raises(RuntimeError, match="Startup failed"):
-        async with open_repositories(postgres_url):
+        async with open_repositories(postgres_url, autocommit=postgres_autocommit):
             pytest.fail("Repositories must not be provided after startup failure")
 
     assert len(pools) == 1 and pools[0].closed

@@ -16,7 +16,7 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         async with (
             open_persistence(
-                database_url, factory=persistence_factory
+                database_url, factory=persistence_factory, autocommit=True
             ) as repositories,
             open_publisher() as publisher,
         ):

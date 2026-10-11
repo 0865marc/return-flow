@@ -23,6 +23,7 @@ async def open_persistence(
     database_url: str | None = None,
     *,
     factory: PersistenceFactory | None = None,
+    autocommit: bool = False,
 ) -> AsyncGenerator[Repositories]:
     url = database_url or os.environ.get("DATABASE_URL")
     if not url:
@@ -30,7 +31,7 @@ async def open_persistence(
     persistence = (
         factory(url)
         if factory is not None
-        else postgres.open_repositories(url)
+        else postgres.open_repositories(url, autocommit=autocommit)
     )
     async with persistence as repositories:
         yield repositories

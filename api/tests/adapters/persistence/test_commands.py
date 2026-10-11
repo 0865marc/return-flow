@@ -1,10 +1,12 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import UUID, uuid4
 
 import pytest
 from psycopg import AsyncConnection, OperationalError
+from psycopg.pq import TransactionStatus
 
 from adapters.commands.contracts import (
     CreateDeliveryCommand,
@@ -12,6 +14,7 @@ from adapters.commands.contracts import (
     RequestReturnCommand,
 )
 from adapters.persistence import Repositories, postgres
+from adapters.persistence.commands import PostgresCommandStore
 from adapters.persistence.postgres import initialize_database
 from application.errors import BusinessRuleViolationError, EntityNotFoundError
 from application.use_cases.deliveries import CreateDelivery
@@ -24,9 +27,11 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 @pytest.fixture
 async def command_repositories(
-    database_url: str,
+    database_url: str, postgres_autocommit: bool,
 ) -> AsyncGenerator[Repositories]:
-    async with postgres.open_repositories(database_url) as repositories:
+    async with postgres.open_repositories(
+        database_url, autocommit=postgres_autocommit
+    ) as repositories:
         yield repositories
 
 
@@ -51,6 +56,29 @@ async def test_register_and_lookup_are_persistent_and_idempotent(
     assert await store.register(command) == first
     assert await store.get(command.command_id) == first
     assert await store.get(uuid4()) is None
+
+
+async def test_command_lookup_only_opens_implicit_transaction_when_autocommit_is_disabled(
+    command_repositories: Repositories, postgres_autocommit: bool,
+) -> None:
+    store = command_repositories.commands
+    assert isinstance(store, PostgresCommandStore)
+    record = await store.register(CreateDeliveryCommand())
+    statuses: list[TransactionStatus] = []
+
+    @asynccontextmanager
+    async def observe_connection() -> AsyncGenerator[AsyncConnection]:
+        async with store.connection_factory() as connection:
+            yield connection
+            # Inspect before the pool's context manager can commit an implicit
+            # transaction. IDLE afterward would also pass with an extra COMMIT.
+            statuses.append(connection.info.transaction_status)
+
+    observed_store = PostgresCommandStore(observe_connection)
+    assert await observed_store.get(record.command_id) == record
+    assert await observed_store.get(uuid4()) is None
+    expected = TransactionStatus.IDLE if postgres_autocommit else TransactionStatus.INTRANS
+    assert statuses == [expected, expected]
 
 
 @pytest.mark.parametrize("changed", ["type", "payload"])

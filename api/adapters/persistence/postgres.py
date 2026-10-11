@@ -117,7 +117,9 @@ class PostgresReturnRepository(_PostgresRepository, ReturnRepository):
 
 
 @asynccontextmanager
-async def open_repositories(database_url: str) -> AsyncGenerator[Repositories]:
+async def open_repositories(
+    database_url: str, *, autocommit: bool = False
+) -> AsyncGenerator[Repositories]:
     """Own one shared asynchronous pool until the application stops."""
     from adapters.persistence.commands import PostgresCommandStore
 
@@ -134,7 +136,9 @@ async def open_repositories(database_url: str) -> AsyncGenerator[Repositories]:
         min_size=1,
         max_size=max_size,
         timeout=timeout,
-        kwargs={"connect_timeout": 5},
+        # Command writes use explicit transactions in PostgresCommandStore.
+        # Autocommit lets API reads release the connection without BEGIN/COMMIT.
+        kwargs={"connect_timeout": 5, "autocommit": autocommit},
         open=False,
     )
     try:
