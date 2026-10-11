@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 
-from adapters.messaging.contracts import IdempotencyConflictError
+from adapters.commands.contracts import CommandExecutionFailedError, IdempotencyConflictError
 from adapters.messaging.publisher import MessagingUnavailableError
 from application.errors import BusinessRuleViolationError, EntityNotFoundError
 
@@ -16,6 +16,12 @@ class CommandPublicationUnavailableError(MessagingUnavailableError):
 
 
 def register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(CommandExecutionFailedError)
+    async def command_execution_failed(
+        request: Request, error: CommandExecutionFailedError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=500, content={"detail": str(error)})
+
     @app.exception_handler(MessagingUnavailableError)
     async def messaging_unavailable(
         request: Request, error: MessagingUnavailableError

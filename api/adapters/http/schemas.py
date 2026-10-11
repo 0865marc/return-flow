@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from adapters.messaging.contracts import CommandType
+from adapters.commands.contracts import CommandType
 from domain.delivery import DeliveryStatus
 from domain.returns import ReturnStatus
 

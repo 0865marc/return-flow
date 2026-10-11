@@ -7,10 +7,10 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
-from adapters.persistence import postgres_pool
-from adapters.persistence.postgres_pool import (
-    PooledPostgresDeliveryRepository,
-    PooledPostgresReturnRepository,
+from adapters.persistence import postgres
+from adapters.persistence.postgres import (
+    PostgresDeliveryRepository,
+    PostgresReturnRepository,
     open_repositories,
 )
 from domain.delivery import Delivery, DeliveryStatus
@@ -20,10 +20,10 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
 async def test_repositories_reuse_connection_and_commit_writes(
-    database_url: str, database_pool
+    database_url: str, database_pool,
 ) -> None:
-    deliveries = PooledPostgresDeliveryRepository(database_pool)
-    returns = PooledPostgresReturnRepository(database_pool)
+    deliveries = PostgresDeliveryRepository(database_pool)
+    returns = PostgresReturnRepository(database_pool)
     async with database_pool.connection() as connection:
         original_backend = connection.info.backend_pid
 
@@ -54,8 +54,8 @@ async def test_repositories_reuse_connection_and_commit_writes(
 async def test_failed_write_rolls_back_and_connection_can_be_reused(
     database_url: str, database_pool
 ) -> None:
-    deliveries = PooledPostgresDeliveryRepository(database_pool)
-    returns = PooledPostgresReturnRepository(database_pool)
+    deliveries = PostgresDeliveryRepository(database_pool)
+    returns = PostgresReturnRepository(database_pool)
     async with database_pool.connection() as connection:
         original_backend = connection.info.backend_pid
 
@@ -79,7 +79,7 @@ async def test_failed_write_rolls_back_and_connection_can_be_reused(
 
 
 async def test_exhausted_pool_times_out_and_recovers(database_pool) -> None:
-    deliveries = PooledPostgresDeliveryRepository(database_pool)
+    deliveries = PostgresDeliveryRepository(database_pool)
 
     async with database_pool.connection():
         with pytest.raises(PoolTimeout):
@@ -98,10 +98,11 @@ async def test_repository_context_closes_shared_pool_when_operation_fails(
     with pytest.raises(RuntimeError, match="Operation failed"):
         async with open_repositories(postgres_url) as repositories:
             assert isinstance(
-                repositories.deliveries, PooledPostgresDeliveryRepository
+                repositories.deliveries, PostgresDeliveryRepository
             )
-            assert isinstance(repositories.returns, PooledPostgresReturnRepository)
+            assert isinstance(repositories.returns, PostgresReturnRepository)
             pool = repositories.deliveries.pool
+            assert pool is not None
             assert repositories.returns.pool is pool
             async with pool.connection() as connection:
                 assert not connection.closed
@@ -113,7 +114,7 @@ async def test_repository_context_closes_shared_pool_when_operation_fails(
 
 
 async def test_repository_context_closes_pool_when_startup_fails(
-    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pools: list[AsyncConnectionPool[AsyncConnection[TupleRow]]] = []
     connections: list[AsyncConnection[TupleRow]] = []
@@ -130,7 +131,7 @@ async def test_repository_context_closes_pool_when_startup_fails(
             connections.append(connection)
         raise RuntimeError("Startup failed")
 
-    monkeypatch.setattr(postgres_pool.AsyncConnectionPool, "open", fail_after_open)
+    monkeypatch.setattr(postgres.AsyncConnectionPool, "open", fail_after_open)
 
     with pytest.raises(RuntimeError, match="Startup failed"):
         async with open_repositories(postgres_url):

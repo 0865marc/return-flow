@@ -7,8 +7,9 @@ from psycopg import AsyncConnection, InterfaceError, OperationalError
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from adapters.messaging.contracts import (
+from adapters.commands.contracts import (
     Command,
+    CommandErrorCode,
     CommandHandler,
     CommandRecord,
     IdempotencyConflictError,
@@ -42,7 +43,8 @@ class PostgresCommandStore:
         async with self.connection_factory() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
-                    "SELECT command_id, type, status, result, error "
+                    "SELECT command_id, type, status, result, error, "
+                    "error_code, created_at, completed_at "
                     "FROM commands WHERE command_id = %s",
                     (command_id,),
                 )
@@ -52,15 +54,13 @@ class PostgresCommandStore:
     async def execute(self, command: Command, handler: CommandHandler) -> CommandRecord:
         async with self.connection_factory() as connection:
             async with connection.transaction():
-                # Also accepts messages published before API-side registration existed.
+                # Direct HTTP executes immediately; queued commands arrive registered.
                 await self._insert_pending(connection, command)
                 record = await self._load(connection, command, lock=True)
                 if record.status == "pending":
                     repositories = Repositories(
-                        deliveries=PostgresDeliveryRepository(
-                            "", connection=connection
-                        ),
-                        returns=PostgresReturnRepository("", connection=connection),
+                        deliveries=PostgresDeliveryRepository(connection=connection),
+                        returns=PostgresReturnRepository(connection=connection),
                     )
                     try:
                         # A savepoint rolls back partial business writes on failure,
@@ -68,14 +68,18 @@ class PostgresCommandStore:
                         async with connection.transaction():
                             result = await handler(repositories)
                     except (OperationalError, InterfaceError):
-                        # Connection failures must be retried by message redelivery.
+                        # Retry via the same HTTP key or via message redelivery.
                         raise
                     except Exception as error:
-                        if isinstance(
-                            error, (EntityNotFoundError, BusinessRuleViolationError)
-                        ):
+                        error_code: CommandErrorCode
+                        if isinstance(error, EntityNotFoundError):
+                            error_code = "not_found"
+                            message = str(error)
+                        elif isinstance(error, BusinessRuleViolationError):
+                            error_code = "business_rule"
                             message = str(error)
                         else:
+                            error_code = "execution_failed"
                             logger.exception("Command %s failed", command.command_id)
                             message = "Command execution failed."
                         record = CommandRecord(
@@ -83,6 +87,7 @@ class PostgresCommandStore:
                             type=command.type,
                             status="failed",
                             error=message,
+                            error_code=error_code,
                         )
                     else:
                         record = CommandRecord(
@@ -91,16 +96,26 @@ class PostgresCommandStore:
                             status="completed",
                             result=result,
                         )
-                    await connection.execute(
-                        "UPDATE commands SET status = %s, result = %s, error = %s "
-                        "WHERE command_id = %s",
-                        (
-                            record.status,
-                            Jsonb(record.result) if record.result is not None else None,
-                            record.error,
-                            command.command_id,
-                        ),
-                    )
+                    async with connection.cursor(row_factory=dict_row) as cursor:
+                        # Sample the database clock after the business writes. This
+                        # timestamp becomes visible atomically with the outcome;
+                        # it precedes COMMIT and is not a precise commit timestamp.
+                        await cursor.execute(
+                            "UPDATE commands SET status = %s, result = %s, error = %s, "
+                            "error_code = %s, "
+                            "completed_at = clock_timestamp() "
+                            "WHERE command_id = %s "
+                            "RETURNING command_id, type, status, result, error, "
+                            "error_code, created_at, completed_at",
+                            (
+                                record.status,
+                                Jsonb(record.result) if record.result is not None else None,
+                                record.error,
+                                record.error_code,
+                                command.command_id,
+                            ),
+                        )
+                        record = CommandRecord.model_validate(await cursor.fetchone())
         # Both context managers have finished: COMMIT errors propagate before
         # the worker can receive a terminal record and acknowledge the message.
         return record
@@ -119,7 +134,8 @@ class PostgresCommandStore:
         connection: AsyncConnection, command: Command, *, lock: bool = False
     ) -> CommandRecord:
         query = (
-            "SELECT command_id, type, payload, status, result, error "
+            "SELECT command_id, type, payload, status, result, error, "
+            "error_code, created_at, completed_at "
             "FROM commands WHERE command_id = %s"
         )
         if lock:

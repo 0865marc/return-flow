@@ -1,16 +1,18 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from uuid import UUID, uuid4
 
 import pytest
 from psycopg import AsyncConnection, OperationalError
 
-from adapters.messaging.contracts import (
+from adapters.commands.contracts import (
     CreateDeliveryCommand,
     IdempotencyConflictError,
     RequestReturnCommand,
 )
-from adapters.persistence import Repositories, postgres, postgres_pool
+from adapters.persistence import Repositories, postgres
+from adapters.persistence.postgres import initialize_database
 from application.errors import BusinessRuleViolationError, EntityNotFoundError
 from application.use_cases.deliveries import CreateDelivery
 from application.use_cases.returns import RequestReturn
@@ -20,12 +22,11 @@ from domain.returns import Return
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
-@pytest.fixture(params=["postgres", "postgres_pool"])
+@pytest.fixture
 async def command_repositories(
-    database_url: str, request: pytest.FixtureRequest
+    database_url: str,
 ) -> AsyncGenerator[Repositories]:
-    adapter = postgres if request.param == "postgres" else postgres_pool
-    async with adapter.open_repositories(database_url) as repositories:
+    async with postgres.open_repositories(database_url) as repositories:
         yield repositories
 
 
@@ -45,6 +46,8 @@ async def test_register_and_lookup_are_persistent_and_idempotent(
 
     assert first.status == "pending"
     assert first.result is None and first.error is None
+    assert first.created_at is not None and first.created_at.tzinfo is not None
+    assert first.completed_at is None
     assert await store.register(command) == first
     assert await store.get(command.command_id) == first
     assert await store.get(uuid4()) is None
@@ -85,6 +88,8 @@ async def test_completed_command_reuses_persisted_result(
 
     assert first.status == "completed"
     assert first.result is not None
+    assert first.created_at is not None and first.completed_at is not None
+    assert first.completed_at >= first.created_at
     assert await store.get(command.command_id) == first
     assert await store.register(command) == first
     assert await store.execute(command, must_not_execute) == first
@@ -126,6 +131,7 @@ async def test_concurrent_copies_commit_only_one_business_operation(
         current = await store.get(command.command_id)
         if registered:
             assert current is not None and current.status == "pending"
+            assert current.completed_at is None
         else:
             assert current is None
     finally:
@@ -173,6 +179,7 @@ async def test_cancellation_rolls_back_and_redelivery_can_execute(
     current = await store.get(command.command_id)
     if registered:
         assert current is not None and current.status == "pending"
+        assert current.completed_at is None
     else:
         assert current is None
     result = await store.execute(command, create_delivery)
@@ -180,15 +187,16 @@ async def test_cancellation_rolls_back_and_redelivery_can_execute(
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_error"),
+    ("error", "expected_error", "expected_code"),
     [
-        (BusinessRuleViolationError("Delivery is pending."), "Delivery is pending."),
-        (EntityNotFoundError("Delivery not found."), "Delivery not found."),
-        (RuntimeError("private database details"), "Command execution failed."),
+        (BusinessRuleViolationError("Delivery is pending."), "Delivery is pending.", "business_rule"),
+        (EntityNotFoundError("Delivery not found."), "Delivery not found.", "not_found"),
+        (RuntimeError("private database details"), "Command execution failed.", "execution_failed"),
     ],
 )
 async def test_failure_rolls_back_partial_writes_and_replays_the_error(
-    command_repositories: Repositories, error: Exception, expected_error: str
+    command_repositories: Repositories, error: Exception, expected_error: str,
+    expected_code: str,
 ) -> None:
     store = command_repositories.commands
     assert store is not None
@@ -204,6 +212,9 @@ async def test_failure_rolls_back_partial_writes_and_replays_the_error(
     assert record.status == "failed"
     assert record.result is None
     assert record.error == expected_error
+    assert record.error_code == expected_code
+    assert record.created_at is not None and record.completed_at is not None
+    assert record.completed_at >= record.created_at
     assert await command_repositories.deliveries.get(delivery.id) is None
     assert await store.get(command.command_id) == record
     # Terminal failures also remain idempotent; a new command can retry the operation.
@@ -253,7 +264,67 @@ async def test_lost_connection_before_commit_does_not_report_success(
     assert await command_repositories.deliveries.get(delivery.id) is None
     record = await store.get(command.command_id)
     assert record is not None and record.status == "pending"
+    assert record.completed_at is None
     assert (await store.execute(command, create_delivery)).status == "completed"
+
+
+async def test_completion_timestamp_uses_clock_after_business_operation(
+    command_repositories: Repositories, database_url: str
+) -> None:
+    store = command_repositories.commands
+    assert store is not None
+    command = CreateDeliveryCommand()
+    registered = await store.register(command)
+    business_finished_at: datetime | None = None
+
+    async def handler(repositories: Repositories) -> dict[str, str]:
+        nonlocal business_finished_at
+        result = await create_delivery(repositories)
+        async with await AsyncConnection.connect(database_url) as connection:
+            cursor = await connection.execute("SELECT clock_timestamp()")
+            row = await cursor.fetchone()
+            assert row is not None
+            business_finished_at = row[0]
+        return result
+
+    completed = await store.execute(command, handler)
+
+    assert completed.created_at == registered.created_at
+    assert completed.created_at is not None
+    assert completed.completed_at is not None and business_finished_at is not None
+    assert completed.created_at <= business_finished_at <= completed.completed_at
+    assert await store.execute(command, handler) == completed
+
+
+async def test_schema_upgrade_preserves_unknown_legacy_timestamps(
+    postgres_url: str,
+) -> None:
+    legacy_id = uuid4()
+    async with await AsyncConnection.connect(postgres_url) as connection:
+        await connection.execute(
+            "CREATE TABLE commands (command_id UUID PRIMARY KEY, type TEXT NOT NULL, "
+            "payload JSONB NOT NULL, status TEXT NOT NULL, result JSONB, error TEXT)"
+        )
+        await connection.execute(
+            "INSERT INTO commands (command_id, type, payload, status, result) "
+            "VALUES (%s, 'create_delivery', '{}'::jsonb, 'completed', "
+            "'{\"delivery_id\": \"legacy\"}'::jsonb)",
+            (legacy_id,),
+        )
+
+    # Repeated startup upgrades must be safe and must not fabricate timing for
+    # commands that completed before instrumentation existed.
+    await initialize_database(postgres_url)
+    await initialize_database(postgres_url)
+
+    async with postgres.open_repositories(postgres_url) as repositories:
+        assert repositories.commands is not None
+        legacy = await repositories.commands.get(legacy_id)
+        assert legacy is not None and legacy.status == "completed"
+        assert legacy.created_at is None and legacy.completed_at is None
+        assert legacy.error_code is None
+        current = await repositories.commands.register(CreateDeliveryCommand())
+        assert current.created_at is not None and current.completed_at is None
 
 
 async def test_distinct_commands_keep_allowing_multiple_returns_for_one_delivery(

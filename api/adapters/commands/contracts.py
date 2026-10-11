@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -47,6 +48,7 @@ Command = Annotated[
 ]
 command_adapter: TypeAdapter[Command] = TypeAdapter[Command](Command)
 CommandType = Literal["create_delivery", "ensure_delivery_delivered", "request_return"]
+CommandErrorCode = Literal["not_found", "business_rule", "execution_failed"]
 
 
 class CommandRecord(BaseModel):
@@ -55,10 +57,18 @@ class CommandRecord(BaseModel):
     status: Literal["pending", "completed", "failed"] = "pending"
     result: dict[str, str] | None = None
     error: str | None = None
+    error_code: CommandErrorCode | None = None
+    # Legacy records predate timing instrumentation and retain unknown timestamps.
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 class IdempotencyConflictError(ValueError):
     """A command identifier was reused for another operation or payload."""
+
+
+class CommandExecutionFailedError(RuntimeError):
+    """A persisted execution failure that is not a business rejection."""
 
 
 CommandHandler = Callable[["Repositories"], Awaitable[dict[str, str]]]

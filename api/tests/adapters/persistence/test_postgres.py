@@ -2,14 +2,11 @@ import asyncio
 from uuid import uuid4
 
 import pytest
-from psycopg import AsyncConnection
 from psycopg.errors import ForeignKeyViolation
-from psycopg.rows import TupleRow
 
 from adapters.persistence.postgres import (
-    PostgresDeliveryRepository,
-    PostgresReturnRepository,
     initialize_database,
+    open_repositories,
 )
 from application.errors import ConcurrentModificationError, EntityNotFoundError
 from domain.delivery import Delivery, DeliveryStatus
@@ -20,10 +17,10 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 async def test_concurrent_api_and_worker_initialization_is_safe(postgres_url) -> None:
     await asyncio.gather(*(initialize_database(postgres_url) for _ in range(8)))
-    repository = PostgresDeliveryRepository(postgres_url)
-    delivery = Delivery()
-    await repository.add(delivery)
-    assert await repository.get(delivery.id) == delivery
+    async with open_repositories(postgres_url) as repositories:
+        delivery = Delivery()
+        await repositories.deliveries.add(delivery)
+        assert await repositories.deliveries.get(delivery.id) == delivery
 
 
 async def test_delivery_can_be_created_loaded_and_updated(repositories) -> None:
@@ -110,43 +107,3 @@ async def test_return_requires_a_persisted_delivery(repositories) -> None:
         await repository.add(return_request)
 
     assert await repository.get(return_request.id) is None
-
-
-async def test_each_operation_opens_and_closes_a_connection(
-    database_url: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    connections: list[AsyncConnection[TupleRow]] = []
-    backends: list[int] = []
-    original_connect = AsyncConnection.connect
-
-    async def connect(conninfo: str, *, connect_timeout: int):
-        connection = await original_connect(conninfo, connect_timeout=connect_timeout)
-        connections.append(connection)
-        backends.append(connection.info.backend_pid)
-        return connection
-
-    monkeypatch.setattr(AsyncConnection, "connect", staticmethod(connect))
-    deliveries = PostgresDeliveryRepository(database_url)
-    returns = PostgresReturnRepository(database_url)
-    delivery = Delivery()
-
-    await deliveries.add(delivery)
-    assert connections[-1].closed
-    assert await deliveries.get(delivery.id) == delivery
-    assert connections[-1].closed
-    delivery.mark_delivered()
-    await deliveries.save(delivery, expected_status=DeliveryStatus.PENDING)
-    assert connections[-1].closed
-
-    returned = Return.request(delivery)
-    await returns.add(returned)
-    assert connections[-1].closed
-    assert await returns.get(returned.id) == returned
-    assert connections[-1].closed
-
-    with pytest.raises(ForeignKeyViolation):
-        await returns.add(Return(delivery_id=uuid4()))
-
-    assert len(connections) == 6
-    assert len(set(backends)) == 6
-    assert all(connection.closed for connection in connections)

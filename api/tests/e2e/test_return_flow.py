@@ -10,16 +10,9 @@ from main import create_app
 pytestmark = [pytest.mark.integration, pytest.mark.e2e]
 
 
-@pytest.fixture(params=["postgres", "postgres_pool"])
-def persistence_adapter(request: pytest.FixtureRequest) -> str:
-    return request.param
-
-
-def test_return_request_persists_after_app_restart(postgres_url, persistence_adapter):
-    with TestClient(
-        create_app(postgres_url, persistence_adapter=persistence_adapter)
-    ) as client:
-        response = client.post("/deliveries")
+def test_return_request_persists_after_app_restart(postgres_url):
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())})
         assert response.status_code == 201
         delivery = response.json()
         assert delivery["status"] == "pending"
@@ -29,15 +22,13 @@ def test_return_request_persists_after_app_restart(postgres_url, persistence_ada
         delivered = response.json()
         assert delivered == {"id": delivery["id"], "status": "delivered"}
 
-        response = client.post("/returns", json={"delivery_id": delivery["id"]})
+        response = client.post("/returns", json={"delivery_id": delivery["id"]}, headers={"Idempotency-Key": str(uuid4())})
         assert response.status_code == 201
         returned = response.json()
         assert returned["delivery_id"] == delivery["id"]
         assert returned["status"] == "requested"
 
-    with TestClient(
-        create_app(postgres_url, persistence_adapter=persistence_adapter)
-    ) as restarted_client:
+    with TestClient(create_app(postgres_url)) as restarted_client:
         response = restarted_client.get(f"/deliveries/{delivery['id']}")
         assert response.status_code == 200
         assert response.json() == delivered
@@ -46,13 +37,11 @@ def test_return_request_persists_after_app_restart(postgres_url, persistence_ada
         assert response.json() == returned
 
 
-def test_pending_delivery_does_not_create_a_return(postgres_url, persistence_adapter):
-    with TestClient(
-        create_app(postgres_url, persistence_adapter=persistence_adapter)
-    ) as client:
-        delivery = client.post("/deliveries").json()
+def test_pending_delivery_does_not_create_a_return(postgres_url):
+    with TestClient(create_app(postgres_url)) as client:
+        delivery = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())}).json()
 
-        response = client.post("/returns", json={"delivery_id": delivery["id"]})
+        response = client.post("/returns", json={"delivery_id": delivery["id"]}, headers={"Idempotency-Key": str(uuid4())})
 
         assert response.status_code == 409
         assert client.get(f"/deliveries/{delivery['id']}").json() == delivery
@@ -61,11 +50,9 @@ def test_pending_delivery_does_not_create_a_return(postgres_url, persistence_ada
         assert connection.execute("SELECT COUNT(*) FROM returns").fetchone() == (0,)
 
 
-def test_unknown_delivery_does_not_create_a_return(postgres_url, persistence_adapter):
-    with TestClient(
-        create_app(postgres_url, persistence_adapter=persistence_adapter)
-    ) as client:
-        response = client.post("/returns", json={"delivery_id": str(uuid4())})
+def test_unknown_delivery_does_not_create_a_return(postgres_url):
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.post("/returns", json={"delivery_id": str(uuid4())}, headers={"Idempotency-Key": str(uuid4())})
 
         assert response.status_code == 404
 
@@ -74,7 +61,7 @@ def test_unknown_delivery_does_not_create_a_return(postgres_url, persistence_ada
 
 
 def test_app_shutdown_closes_pool_and_its_connections(postgres_url):
-    application = create_app(postgres_url, persistence_adapter="postgres_pool")
+    application = create_app(postgres_url)
 
     with TestClient(application) as client:
         pool = application.state.delivery_repository.pool
@@ -95,19 +82,19 @@ def test_app_shutdown_closes_pool_and_its_connections(postgres_url):
 def test_exhausted_pool_returns_503_and_recovers(postgres_url, monkeypatch):
     monkeypatch.setenv("DATABASE_POOL_MAX_SIZE", "1")
     monkeypatch.setenv("DATABASE_POOL_TIMEOUT", "0.05")
-    application = create_app(postgres_url, persistence_adapter="postgres_pool")
+    application = create_app(postgres_url)
 
     with TestClient(application) as client:
         assert client.portal is not None
         context = application.state.delivery_repository.pool.connection()
         client.portal.call(context.__aenter__)
         try:
-            response = client.post("/deliveries")
+            response = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())})
             assert response.status_code == 503
         finally:
             client.portal.call(context.__aexit__, None, None, None)
 
-        response = client.post("/deliveries")
+        response = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())})
         assert response.status_code == 201
         delivery = response.json()
         assert client.get(f"/deliveries/{delivery['id']}").json() == delivery
@@ -116,14 +103,11 @@ def test_exhausted_pool_returns_503_and_recovers(postgres_url, monkeypatch):
         assert connection.execute("SELECT COUNT(*) FROM deliveries").fetchone() == (1,)
 
 
-def test_environment_selects_persistence_at_app_creation(postgres_url, monkeypatch):
-    monkeypatch.setenv("PERSISTENCE_ADAPTER", "postgres_pool")
+def test_app_uses_a_connection_pool_by_default(postgres_url):
     application = create_app(postgres_url)
-    # Later environment changes do not alter an already configured application.
-    monkeypatch.setenv("PERSISTENCE_ADAPTER", "postgres")
 
     with TestClient(application) as client:
         assert isinstance(application.state.delivery_repository.pool, AsyncConnectionPool)
-        delivery = client.post("/deliveries")
+        delivery = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())})
         assert delivery.status_code == 201
         assert client.get(f"/deliveries/{delivery.json()['id']}").json() == delivery.json()

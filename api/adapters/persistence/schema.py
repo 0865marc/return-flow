@@ -20,6 +20,9 @@ SCHEMA_STATEMENTS = (
         status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
         result JSONB,
         error TEXT,
+        error_code TEXT,
+        created_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+        completed_at TIMESTAMPTZ,
         CHECK (
             (status = 'pending' AND result IS NULL AND error IS NULL)
             OR (status = 'completed' AND result IS NOT NULL AND error IS NULL)
@@ -27,4 +30,15 @@ SCHEMA_STATEMENTS = (
         )
     )
     """,
+    # Add columns without a default first so existing records retain unknown
+    # historical timing instead of acquiring the schema upgrade timestamp.
+    """
+    ALTER TABLE commands
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ
+    """,
+    """
+    ALTER TABLE commands ALTER COLUMN created_at SET DEFAULT clock_timestamp()
+    """,
+    "ALTER TABLE commands ADD COLUMN IF NOT EXISTS error_code TEXT",
 )

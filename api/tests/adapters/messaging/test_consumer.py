@@ -8,7 +8,8 @@ import pytest
 from pydantic import ValidationError
 
 from adapters.messaging.consumer import CommandConsumer
-from adapters.messaging.contracts import (
+from adapters.commands.executor import execute_command
+from adapters.commands.contracts import (
     CommandRecord,
     CreateDeliveryCommand,
     EnsureDeliveryDelivered,
@@ -130,7 +131,7 @@ async def test_ensure_delivered_reuses_state_after_concurrent_completion(concurr
     )
     await repository.add(delivery)
     command = EnsureDeliveryDelivered(delivery_id=delivery.id)
-    result = await CommandConsumer(None)._execute(
+    result = await execute_command(
         command, Repositories(repository, InMemoryReturnRepository())
     )
     assert result == {"id": str(delivery.id), "status": "delivered"}

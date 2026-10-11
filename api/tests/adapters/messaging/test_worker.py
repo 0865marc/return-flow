@@ -57,10 +57,8 @@ def worker_resources(monkeypatch):
     queue = SimpleNamespace(iterator=Mock(side_effect=iterator))
     connect = AsyncMock(return_value=connection)
     topology = AsyncMock(return_value=queue)
-    get_factory = Mock(return_value=factory)
     open_persistence = Mock(side_effect=persistence)
     make_consumer = Mock(return_value=SimpleNamespace(handle=handler))
-    monkeypatch.setattr(worker, "get_persistence_factory", get_factory)
     monkeypatch.setattr(worker, "open_persistence", open_persistence)
     monkeypatch.setattr(worker, "connect_robust", connect)
     monkeypatch.setattr(worker, "declare_topology", topology)
@@ -69,7 +67,6 @@ def worker_resources(monkeypatch):
         events=events,
         repository=repository,
         factory=factory,
-        get_factory=get_factory,
         open_persistence=open_persistence,
         messages=messages,
         handler=handler,
@@ -88,10 +85,9 @@ async def test_worker_wires_resources_and_closes_them_in_reverse_order(worker_re
     )
 
     await worker.run_worker(
-        settings, "postgresql://localhost/test", persistence_adapter="postgres"
+        settings, "postgresql://localhost/test", persistence_factory=resources.factory
     )
 
-    resources.get_factory.assert_called_once_with("postgres")
     resources.open_persistence.assert_called_once_with(
         "postgresql://localhost/test", factory=resources.factory
     )

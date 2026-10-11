@@ -1,9 +1,12 @@
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from math import isfinite
 from uuid import UUID
 
 from psycopg import AsyncConnection
-from psycopg.rows import dict_row
+from psycopg.rows import TupleRow, dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from adapters.persistence import Repositories
 from adapters.persistence.schema import SCHEMA_STATEMENTS
@@ -29,11 +32,16 @@ async def initialize_database(database_url: str) -> None:
                 await cursor.execute(statement)
 
 
-class PostgresDeliveryRepository(DeliveryRepository):
+class _PostgresRepository:
     def __init__(
-        self, database_url: str, *, connection: AsyncConnection | None = None
+        self,
+        pool: AsyncConnectionPool[AsyncConnection[TupleRow]] | None = None,
+        *,
+        connection: AsyncConnection | None = None,
     ) -> None:
-        self.database_url = database_url
+        if (pool is None) == (connection is None):
+            raise ValueError("Provide either a connection pool or a bound connection.")
+        self.pool = pool
         self.connection = connection
 
     @asynccontextmanager
@@ -42,11 +50,12 @@ class PostgresDeliveryRepository(DeliveryRepository):
             # The command store owns this connection and its transaction.
             yield self.connection
         else:
-            async with await AsyncConnection.connect(
-                self.database_url, connect_timeout=5
-            ) as connection:
+            assert self.pool is not None
+            async with self.pool.connection() as connection:
                 yield connection
 
+
+class PostgresDeliveryRepository(_PostgresRepository, DeliveryRepository):
     async def add(self, delivery: Delivery) -> None:
         async with self._connection() as connection:
             async with connection.cursor() as cursor:
@@ -83,23 +92,7 @@ class PostgresDeliveryRepository(DeliveryRepository):
                     )
 
 
-class PostgresReturnRepository(ReturnRepository):
-    def __init__(
-        self, database_url: str, *, connection: AsyncConnection | None = None
-    ) -> None:
-        self.database_url = database_url
-        self.connection = connection
-
-    @asynccontextmanager
-    async def _connection(self) -> AsyncGenerator[AsyncConnection]:
-        if self.connection is not None:
-            yield self.connection
-        else:
-            async with await AsyncConnection.connect(
-                self.database_url, connect_timeout=5
-            ) as connection:
-                yield connection
-
+class PostgresReturnRepository(_PostgresRepository, ReturnRepository):
     async def add(self, returned: Return) -> None:
         async with self._connection() as connection:
             async with connection.cursor() as cursor:
@@ -125,19 +118,32 @@ class PostgresReturnRepository(ReturnRepository):
 
 @asynccontextmanager
 async def open_repositories(database_url: str) -> AsyncGenerator[Repositories]:
-    """Initialize PostgreSQL; each repository operation opens its own connection."""
-    await initialize_database(database_url)
+    """Own one shared asynchronous pool until the application stops."""
     from adapters.persistence.commands import PostgresCommandStore
 
-    @asynccontextmanager
-    async def open_connection() -> AsyncGenerator[AsyncConnection]:
-        async with await AsyncConnection.connect(
-            database_url, connect_timeout=5
-        ) as connection:
-            yield connection
+    max_size = int(os.environ.get("DATABASE_POOL_MAX_SIZE", "10"))
+    timeout = float(os.environ.get("DATABASE_POOL_TIMEOUT", "5"))
+    if max_size < 1:
+        raise ValueError("DATABASE_POOL_MAX_SIZE must be at least 1.")
+    if not isfinite(timeout) or timeout <= 0:
+        raise ValueError("DATABASE_POOL_TIMEOUT must be a positive finite number.")
 
-    yield Repositories(
-        deliveries=PostgresDeliveryRepository(database_url),
-        returns=PostgresReturnRepository(database_url),
-        commands=PostgresCommandStore(open_connection),
+    pool = AsyncConnectionPool(
+        database_url,
+        connection_class=AsyncConnection[TupleRow],
+        min_size=1,
+        max_size=max_size,
+        timeout=timeout,
+        kwargs={"connect_timeout": 5},
+        open=False,
     )
+    try:
+        await initialize_database(database_url)
+        await pool.open(wait=True, timeout=5)
+        yield Repositories(
+            deliveries=PostgresDeliveryRepository(pool),
+            returns=PostgresReturnRepository(pool),
+            commands=PostgresCommandStore(pool.connection),
+        )
+    finally:
+        await pool.close()

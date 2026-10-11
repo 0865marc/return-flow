@@ -6,7 +6,7 @@ from aio_pika.abc import AbstractChannel, AbstractConnection
 from aio_pika.exceptions import AMQPException, ChannelInvalidStateError
 from pamqp.commands import Basic
 
-from .contracts import Command
+from adapters.commands.contracts import Command
 from .settings import MessagingSettings
 from .topology import declare_topology
 

@@ -9,7 +9,7 @@ from aio_pika.exceptions import ChannelInvalidStateError, DeliveryError
 from pamqp.commands import Basic
 
 from adapters.messaging import publisher as publisher_module
-from adapters.messaging.contracts import EnsureDeliveryDelivered
+from adapters.commands.contracts import EnsureDeliveryDelivered
 from adapters.messaging.publisher import MessagingUnavailableError, RabbitMQPublisher
 from adapters.messaging.settings import MessagingSettings
 

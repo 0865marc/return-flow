@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from application.ports.repositories import DeliveryRepository, ReturnRepository
 
 if TYPE_CHECKING:
-    from adapters.messaging.contracts import CommandStore
+    from adapters.commands.contracts import CommandStore
 
 
 @dataclass(frozen=True)

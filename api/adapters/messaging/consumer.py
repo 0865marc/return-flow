@@ -3,28 +3,19 @@ import logging
 from aio_pika.abc import AbstractIncomingMessage
 from pydantic import ValidationError
 
-from adapters.messaging.contracts import (
-    Command,
+from adapters.commands.contracts import (
     CommandStore,
-    CreateDeliveryCommand,
-    EnsureDeliveryDelivered,
     IdempotencyConflictError,
-    RequestReturnCommand,
     command_adapter,
 )
-from adapters.persistence import Repositories
-from application.errors import BusinessRuleViolationError
-from application.ports.repositories import DeliveryRepository
-from application.use_cases.deliveries import CreateDelivery, GetDelivery, MarkDeliveryDelivered
-from application.use_cases.returns import RequestReturn
-from domain import Delivery, DeliveryStatus
+from adapters.commands.executor import CommandExecutor
 
 logger = logging.getLogger(__name__)
 
 
 class CommandConsumer:
     def __init__(self, store: CommandStore) -> None:
-        self.store = store
+        self.executor = CommandExecutor(store)
 
     async def handle(self, message: AbstractIncomingMessage) -> None:
         command_id = message.message_id or "unknown"
@@ -37,9 +28,7 @@ class CommandConsumer:
 
         command_id = str(command.command_id)
         try:
-            record = await self.store.execute(
-                command, lambda repositories: self._execute(command, repositories)
-            )
+            record = await self.executor.execute(command)
         except IdempotencyConflictError:
             logger.exception("Conflicting command command_id=%s", command_id)
             await message.reject(requeue=False)
@@ -57,31 +46,3 @@ class CommandConsumer:
         # for redelivery. An ACK failure also must not dead-letter committed work.
         await message.ack()
         logger.info("Command completed command_id=%s", command_id)
-
-    async def _execute(self, command: Command, repositories: Repositories) -> dict[str, str]:
-        if isinstance(command, CreateDeliveryCommand):
-            result = await CreateDelivery(repositories.deliveries).execute()
-        elif isinstance(command, RequestReturnCommand):
-            result = await RequestReturn(
-                repositories.deliveries, repositories.returns
-            ).execute(command.delivery_id)
-        else:
-            result = await self._ensure_delivered(command, repositories.deliveries)
-        return result.model_dump(mode="json")
-
-    async def _ensure_delivered(
-        self, command: EnsureDeliveryDelivered, repository: DeliveryRepository
-    ) -> Delivery:
-        delivery = await GetDelivery(repository).execute(command.delivery_id)
-        if delivery.status == DeliveryStatus.DELIVERED:
-            return delivery
-
-        try:
-            return await MarkDeliveryDelivered(repository).execute(command.delivery_id)
-        except BusinessRuleViolationError:
-            # Another consumer or the synchronous HTTP endpoint may complete
-            # the transition between either read and the conditional write.
-            delivery = await GetDelivery(repository).execute(command.delivery_id)
-            if delivery.status != DeliveryStatus.DELIVERED:
-                raise
-            return delivery

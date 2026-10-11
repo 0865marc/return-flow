@@ -1,9 +1,9 @@
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, Response, status
+from fastapi import APIRouter, Depends, Response, status
 
-from adapters.messaging.contracts import (
+from adapters.commands.contracts import (
     Command,
     CommandPublisher,
     CommandStore,
@@ -13,18 +13,19 @@ from adapters.messaging.contracts import (
 )
 from adapters.messaging.publisher import MessagingUnavailableError
 from application.errors import EntityNotFoundError
+from application.ports.delivery_flow import DeliveryFlow
 from application.ports.repositories import DeliveryRepository, ReturnRepository
-from application.use_cases.deliveries import (
-    CreateDelivery,
-    GetDelivery,
-    MarkDeliveryDelivered,
-)
-from application.use_cases.returns import GetReturn, RequestReturn
+from application.use_cases.deliveries import GetDelivery
+from application.use_cases.returns import GetReturn
 
 from .dependencies import (
+    IdempotencyKey,
+    OptionalIdempotencyKey,
     get_command_publisher,
     get_command_store,
     get_delivery_repository,
+    get_delivery_flow,
+    get_delivery_update_flow,
     get_return_repository,
 )
 from .errors import CommandPublicationUnavailableError
@@ -46,8 +47,8 @@ CommandPublisherDependency = Annotated[
     CommandPublisher | None, Depends(get_command_publisher)
 ]
 CommandStoreDependency = Annotated[CommandStore, Depends(get_command_store)]
-IdempotencyKey = Annotated[UUID, Header(alias="Idempotency-Key")]
-OptionalIdempotencyKey = Annotated[UUID | None, Header(alias="Idempotency-Key")]
+DeliveryFlowDependency = Annotated[DeliveryFlow, Depends(get_delivery_flow)]
+DeliveryUpdateFlowDependency = Annotated[DeliveryFlow, Depends(get_delivery_update_flow)]
 
 
 async def _enqueue_command(
@@ -69,8 +70,8 @@ async def _enqueue_command(
 
 
 @router.post("/deliveries", status_code=status.HTTP_201_CREATED)
-async def create_delivery(repository: DeliveryRepositoryDependency) -> DeliveryResponse:
-    delivery = await CreateDelivery(repository).execute()
+async def create_delivery(flow: DeliveryFlowDependency) -> DeliveryResponse:
+    delivery = await flow.create_delivery()
     return DeliveryResponse.model_validate(delivery)
 
 
@@ -113,9 +114,9 @@ async def get_delivery(
 
 @router.post("/deliveries/{delivery_id}/deliver")
 async def mark_delivery_delivered(
-    delivery_id: UUID, repository: DeliveryRepositoryDependency
+    delivery_id: UUID, flow: DeliveryUpdateFlowDependency
 ) -> DeliveryResponse:
-    delivery = await MarkDeliveryDelivered(repository).execute(delivery_id)
+    delivery = await flow.mark_delivered(delivery_id)
     return DeliveryResponse.model_validate(delivery)
 
 
@@ -146,12 +147,9 @@ async def enqueue_delivery(
 @router.post("/returns", status_code=status.HTTP_201_CREATED)
 async def request_return(
     body: RequestReturnBody,
-    delivery_repository: DeliveryRepositoryDependency,
-    return_repository: ReturnRepositoryDependency,
+    flow: DeliveryFlowDependency,
 ) -> ReturnResponse:
-    returned = await RequestReturn(delivery_repository, return_repository).execute(
-        body.delivery_id
-    )
+    returned = await flow.request_return(body.delivery_id)
     return ReturnResponse.model_validate(returned)
 
 

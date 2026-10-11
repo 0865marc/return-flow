@@ -7,7 +7,7 @@ from aio_pika import connect_robust
 from adapters.messaging.consumer import CommandConsumer
 from adapters.messaging.settings import MessagingSettings
 from adapters.messaging.topology import declare_topology
-from composition import get_persistence_factory, open_persistence
+from composition import PersistenceFactory, open_persistence
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +16,10 @@ async def run_worker(
     settings: MessagingSettings | None = None,
     database_url: str | None = None,
     *,
-    persistence_adapter: str | None = None,
+    persistence_factory: PersistenceFactory | None = None,
 ) -> None:
     settings = settings or MessagingSettings.from_env()
-    factory = get_persistence_factory(persistence_adapter)
-    async with open_persistence(database_url, factory=factory) as repositories:
+    async with open_persistence(database_url, factory=persistence_factory) as repositories:
         if repositories.commands is None:
             raise RuntimeError("The worker requires a command store.")
         connection = await connect_robust(

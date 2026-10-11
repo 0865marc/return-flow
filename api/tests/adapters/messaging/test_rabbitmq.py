@@ -11,11 +11,11 @@ from aio_pika.exceptions import ChannelNotFoundEntity
 from fastapi.testclient import TestClient
 
 from adapters.messaging.consumer import CommandConsumer
-from adapters.messaging.contracts import EnsureDeliveryDelivered, RequestReturnCommand
+from adapters.commands.contracts import CreateDeliveryCommand, EnsureDeliveryDelivered, RequestReturnCommand
 from adapters.messaging.publisher import MessagingUnavailableError, RabbitMQPublisher
 from adapters.messaging.settings import MessagingSettings
 from adapters.messaging.topology import declare_topology
-from composition import get_persistence_factory, open_persistence
+from composition import open_persistence
 from domain.delivery import Delivery, DeliveryStatus
 from main import create_app
 from worker import run_worker
@@ -61,9 +61,7 @@ async def publisher(rabbitmq) -> AsyncGenerator[RabbitMQPublisher]:
 
 @pytest.fixture
 async def repositories(postgres_url: str):
-    async with open_persistence(
-        postgres_url, factory=get_persistence_factory("postgres")
-    ) as repositories:
+    async with open_persistence(postgres_url) as repositories:
         yield repositories
 
 
@@ -104,6 +102,40 @@ async def test_command_waits_for_a_worker_and_is_acknowledged_after_commit(
     assert await queue.get(fail=False, timeout=5) is None
     failed = await channel.get_queue(f"{settings.queue_name}.failed")
     assert await failed.get(fail=False, timeout=5) is None
+
+
+@pytest.mark.parametrize("first_transport", ["direct", "queued"])
+async def test_http_and_worker_share_one_result_for_the_same_command(
+    repositories, postgres_url, rabbitmq, publisher, monkeypatch, first_transport
+) -> None:
+    settings, connection = rabbitmq
+    monkeypatch.setenv("RABBITMQ_URL", settings.url)
+    monkeypatch.setenv("RABBITMQ_QUEUE", settings.queue_name)
+    command = CreateDeliveryCommand()
+    headers = {"Idempotency-Key": str(command.command_id)}
+    with TestClient(create_app(postgres_url)) as client:
+        if first_transport == "queued":
+            assert client.post("/deliveries-async", headers=headers).status_code == 202
+            assert client.get(f"/commands/{command.command_id}").json()["status"] == "pending"
+        direct = client.post("/deliveries", headers=headers)
+        assert direct.status_code == 201
+        if first_transport == "direct":
+            assert client.post("/deliveries-async", headers=headers).status_code == 202
+            # Simulate a duplicate publication of the already completed command.
+            await publisher.publish(command)
+
+        channel = await connection.channel()
+        queue = await channel.get_queue(settings.queue_name)
+        message = await next_message(queue)
+        await CommandConsumer(repositories.commands).handle(message)
+        assert await queue.get(fail=False, timeout=5) is None
+        assert client.post("/deliveries", headers=headers).json() == direct.json()
+        record = client.get(f"/commands/{command.command_id}").json()
+        assert record["status"] == "completed"
+        assert record["result"] == direct.json()
+    with psycopg.connect(postgres_url) as database:
+        assert database.execute("SELECT COUNT(*) FROM deliveries").fetchone() == (1,)
+        assert database.execute("SELECT COUNT(*) FROM commands").fetchone() == (1,)
 
 
 class SimulatedWorkerCrash(RuntimeError):
@@ -200,6 +232,10 @@ async def test_unroutable_publish_is_not_reported_as_accepted(
         await publisher.publish(command)
 
 
+
+
+
+
 async def wait_for_command(client, command_id, task, *, status="completed"):
     async with asyncio.timeout(10):
         while True:
@@ -217,16 +253,15 @@ async def wait_for_command(client, command_id, task, *, status="completed"):
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("persistence_adapter", ["postgres", "postgres_pool"])
 async def test_complete_async_return_flow_and_idempotent_http_retries(
-    rabbitmq, postgres_url, monkeypatch, persistence_adapter
+    rabbitmq, postgres_url, monkeypatch
 ) -> None:
     settings, _ = rabbitmq
     monkeypatch.setenv("RABBITMQ_URL", settings.url)
     monkeypatch.setenv("RABBITMQ_QUEUE", settings.queue_name)
 
     with TestClient(
-        create_app(postgres_url, persistence_adapter=persistence_adapter)
+        create_app(postgres_url)
     ) as client:
         create_id = str(uuid4())
         create_headers = {"Idempotency-Key": create_id}
@@ -247,7 +282,7 @@ async def test_complete_async_return_flow_and_idempotent_http_retries(
             assert database.execute("SELECT COUNT(*) FROM deliveries").fetchone() == (0,)
 
         task = asyncio.create_task(
-            run_worker(settings, postgres_url, persistence_adapter=persistence_adapter)
+            run_worker(settings, postgres_url)
         )
         try:
             created = await wait_for_command(client, create_id, task)
@@ -311,7 +346,7 @@ async def test_complete_async_return_flow_and_idempotent_http_retries(
             response = client.post(f"/deliveries/{delivery_id}/deliver-async")
             assert response.status_code == 202
             await wait_for_command(client, response.json()["command_id"], task)
-            assert client.post(f"/deliveries/{delivery_id}/deliver").status_code == 409
+            assert client.post(f"/deliveries/{delivery_id}/deliver").status_code == 200
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -319,18 +354,17 @@ async def test_complete_async_return_flow_and_idempotent_http_retries(
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("persistence_adapter", ["postgres", "postgres_pool"])
 async def test_business_failure_is_queryable_and_dead_lettered(
-    rabbitmq, postgres_url, monkeypatch, persistence_adapter
+    rabbitmq, postgres_url, monkeypatch
 ) -> None:
     settings, connection = rabbitmq
     monkeypatch.setenv("RABBITMQ_URL", settings.url)
     monkeypatch.setenv("RABBITMQ_QUEUE", settings.queue_name)
 
     with TestClient(
-        create_app(postgres_url, persistence_adapter=persistence_adapter)
+        create_app(postgres_url)
     ) as client:
-        delivery = client.post("/deliveries").json()
+        delivery = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())}).json()
         command_id = str(uuid4())
         response = client.post(
             "/returns-async",
@@ -339,7 +373,7 @@ async def test_business_failure_is_queryable_and_dead_lettered(
         )
         assert response.status_code == 202
         task = asyncio.create_task(
-            run_worker(settings, postgres_url, persistence_adapter=persistence_adapter)
+            run_worker(settings, postgres_url)
         )
         try:
             failed = await wait_for_command(client, command_id, task, status="failed")

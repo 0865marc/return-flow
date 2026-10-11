@@ -9,37 +9,13 @@ from fastapi.testclient import TestClient
 
 import composition
 from adapters.http import register_exception_handlers, router
-from adapters.messaging.contracts import (
-    Command,
-    CommandRecord,
-    IdempotencyConflictError,
-)
+from adapters.commands.contracts import CommandRecord
 from adapters.messaging.publisher import MessagingUnavailableError
 from adapters.persistence import Repositories
 from main import create_app
+from tests.adapters.http.fakes import FakeCommandStore
 from tests.application.fakes import InMemoryDeliveryRepository, InMemoryReturnRepository
 
-
-class FakeCommandStore:
-    def __init__(self):
-        self.commands = {}
-        self.records = {}
-
-    async def register(self, command: Command) -> CommandRecord:
-        previous = self.commands.get(command.command_id)
-        if previous is not None and previous != command:
-            raise IdempotencyConflictError(
-                "Idempotency-Key already identifies a different command."
-            )
-        if previous is None:
-            self.commands[command.command_id] = command
-            self.records[command.command_id] = CommandRecord(
-                command_id=command.command_id, type=command.type
-            )
-        return self.records[command.command_id]
-
-    async def get(self, command_id: UUID) -> CommandRecord | None:
-        return self.records.get(command_id)
 
 
 @pytest.fixture
@@ -47,7 +23,9 @@ def client():
     app = FastAPI()
     app.state.delivery_repository = InMemoryDeliveryRepository()
     app.state.return_repository = InMemoryReturnRepository()
-    app.state.command_store = FakeCommandStore()
+    app.state.command_store = FakeCommandStore(Repositories(
+        app.state.delivery_repository, app.state.return_repository
+    ))
     app.state.command_publisher = SimpleNamespace(publish=AsyncMock())
     app.include_router(router)
     register_exception_handlers(app)
@@ -56,7 +34,7 @@ def client():
 
 
 def test_async_endpoint_publishes_without_mutating_the_delivery(client):
-    delivery = client.post("/deliveries").json()
+    delivery = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())}).json()
     response = client.post(f"/deliveries/{delivery['id']}/deliver-async")
 
     assert response.status_code == 202
@@ -275,7 +253,7 @@ def test_unconfirmed_publication_returns_id_and_can_be_retried(client, operation
 
 def test_unconfigured_messaging_returns_recoverable_503_while_sync_routes_work(client):
     client.app.state.command_publisher = None
-    delivery = client.post("/deliveries").json()
+    delivery = client.post("/deliveries", headers={"Idempotency-Key": str(uuid4())}).json()
     response = client.post(f"/deliveries/{delivery['id']}/deliver-async")
     assert response.status_code == 503
     assert UUID(response.json()["command_id"])
@@ -293,11 +271,10 @@ def test_app_lifecycle_creates_lazy_publisher_and_closes_it(monkeypatch):
         )
 
     publisher = SimpleNamespace(publish=AsyncMock(), close=AsyncMock())
-    monkeypatch.setitem(composition.PERSISTENCE_FACTORIES, "test", persistence_factory)
     monkeypatch.setenv("RABBITMQ_URL", "amqp://unused/")
     monkeypatch.setattr(composition, "RabbitMQPublisher", lambda settings: publisher)
 
-    with TestClient(create_app("unused", persistence_adapter="test")) as client:
+    with TestClient(create_app("unused", persistence_factory=persistence_factory)) as client:
         assert client.app.state.command_store is store
         assert client.get("/health").status_code == 200
         publisher.publish.assert_not_awaited()

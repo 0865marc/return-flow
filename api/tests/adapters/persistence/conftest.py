@@ -5,7 +5,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 
-from adapters.persistence import postgres, postgres_pool
+from adapters.persistence import postgres
 from adapters.persistence.postgres import initialize_database
 from application.ports.repositories import DeliveryRepository, ReturnRepository
 
@@ -36,10 +36,9 @@ async def database_pool(
         await pool.close()
 
 
-@pytest.fixture(params=["postgres", "postgres_pool"])
+@pytest.fixture
 async def repositories(
-    database_url: str, request: pytest.FixtureRequest
+    database_url: str,
 ) -> AsyncGenerator[tuple[DeliveryRepository, ReturnRepository]]:
-    adapter = postgres if request.param == "postgres" else postgres_pool
-    async with adapter.open_repositories(database_url) as repositories:
+    async with postgres.open_repositories(database_url) as repositories:
         yield repositories.deliveries, repositories.returns
