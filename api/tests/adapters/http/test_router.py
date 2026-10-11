@@ -122,10 +122,12 @@ def test_invalid_return_body_returns_422(client, body):
 
 @pytest.mark.parametrize("path,body", [
     ("/deliveries", None), ("/returns", {"delivery_id": str(uuid4())}),
+    ("/integrations/deliveries", None),
+    ("/integrations/returns", {"id_entrega": str(uuid4())}),
 ])
 @pytest.mark.parametrize("idempotency_key", [None, "invalid"])
 def test_direct_creations_require_valid_idempotency_key(client, path, body, idempotency_key):
-    headers = {}
+    headers = {"X-Carrier": "correos"}
     if idempotency_key is not None:
         headers["Idempotency-Key"] = idempotency_key
     response = client.post(path, headers=headers, json=body)

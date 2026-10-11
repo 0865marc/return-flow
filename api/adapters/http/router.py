@@ -29,6 +29,7 @@ from .dependencies import (
     get_return_repository,
 )
 from .errors import CommandPublicationUnavailableError
+from .integrations import router as integration_router
 from .schemas import (
     CommandAcceptedResponse,
     CommandResponse,
@@ -182,3 +183,6 @@ async def get_return(
 ) -> ReturnResponse:
     returned = await GetReturn(repository).execute(return_id)
     return ReturnResponse.model_validate(returned)
+
+
+router.include_router(integration_router)

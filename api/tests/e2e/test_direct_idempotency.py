@@ -109,3 +109,22 @@ def test_business_failure_remains_the_same_after_state_changes_and_restart(postg
 
     with psycopg.connect(postgres_url) as connection:
         assert connection.execute("SELECT COUNT(*) FROM returns").fetchone() == (1,)
+
+
+def test_carrier_and_generic_routes_share_normalized_command_identity(postgres_url):
+    headers = key()
+    with TestClient(create_app(postgres_url)) as client:
+        created = client.post(
+            "/integrations/deliveries", headers={**headers, "X-Carrier": "correos"}
+        )
+        assert created.status_code == 201
+        generic = client.post("/deliveries", headers=headers)
+        assert generic.status_code == 201
+        assert generic.json()["id"] == created.json()["id_entrega"]
+        dhl = client.post(
+            "/integrations/deliveries", headers={**headers, "X-Carrier": "dhl"}
+        )
+        assert dhl.status_code == 201
+        assert dhl.json()["shipmentId"] == generic.json()["id"]
+    with psycopg.connect(postgres_url) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM deliveries").fetchone() == (1,)

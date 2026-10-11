@@ -2,11 +2,20 @@ import os
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
+from adapters.carriers.contracts import CarrierAdapter
+from adapters.carriers.correos import CorreosAdapter
+from adapters.carriers.dhl import DHLAdapter
 from adapters.messaging.publisher import RabbitMQPublisher
 from adapters.messaging.settings import MessagingSettings
 from adapters.persistence import Repositories, postgres
 
 PersistenceFactory = Callable[[str], AbstractAsyncContextManager[Repositories]]
+
+# Register payload formats here; HTTP routes depend on their common contract.
+CARRIER_ADAPTERS: dict[str, CarrierAdapter] = {
+    "correos": CorreosAdapter(),
+    "dhl": DHLAdapter(),
+}
 
 
 @asynccontextmanager

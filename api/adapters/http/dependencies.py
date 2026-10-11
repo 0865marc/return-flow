@@ -3,10 +3,12 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
+from adapters.carriers.contracts import CarrierAdapter
 from adapters.commands.contracts import CommandPublisher, CommandStore
 from adapters.commands.flow import IdempotentDeliveryFlow
 from application.ports.delivery_flow import DeliveryFlow
 from application.ports.repositories import DeliveryRepository, ReturnRepository
+from composition import CARRIER_ADAPTERS
 
 
 async def get_delivery_repository(request: Request) -> DeliveryRepository:
@@ -15,6 +17,25 @@ async def get_delivery_repository(request: Request) -> DeliveryRepository:
 
 async def get_return_repository(request: Request) -> ReturnRepository:
     return request.app.state.return_repository
+
+
+def get_carrier_adapter(
+    carrier: Annotated[
+        str,
+        Header(
+            alias="X-Carrier",
+            description="Simulated payload format; this header is not authentication.",
+            json_schema_extra={"enum": list(CARRIER_ADAPTERS)},
+        ),
+    ],
+) -> CarrierAdapter:
+    adapter = CARRIER_ADAPTERS.get(carrier)
+    if adapter is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Unknown carrier {carrier!r}. Choose from: {', '.join(CARRIER_ADAPTERS)}.",
+        )
+    return adapter
 
 
 async def get_command_publisher(request: Request) -> CommandPublisher | None:
