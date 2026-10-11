@@ -39,25 +39,24 @@ def summary(*, attempted=100, completed=100, dropped=0, unknown=0, errors=0, ela
 
 def test_each_pair_has_the_same_load_and_alternates_execution_order():
     plan = list(make_plan(arguments([
-        "--adapters", "postgres", "postgres_pool",
+        "--adapters", "postgres_pool", "event_driven",
         "--repetitions", "2", "--rates", "10", "50",
     ])))
-    assert [row["adapter"] for row in plan[:4]] == ["postgres", "postgres_pool"] * 2
-    assert [row["adapter"] for row in plan[4:]] == ["postgres_pool", "postgres"] * 2
+    assert [row["adapter"] for row in plan[:4]] == ["postgres_pool", "event_driven"] * 2
+    assert [row["adapter"] for row in plan[4:]] == ["event_driven", "postgres_pool"] * 2
     for left, right in zip(plan[::2], plan[1::2]):
-        assert {key: val for key, val in left.items() if key != "adapter"} == {
-            key: val for key, val in right.items() if key != "adapter"
-        }
+        for key in ("scenario", "rate", "repetition", "application_cpus", "persistence_adapter", "idempotency"):
+            assert left[key] == right[key]
 
 
 def test_smoke_covers_each_adapter_and_scenario_once():
     plan = list(make_plan(arguments(["--smoke"])))
-    assert len(plan) == 6
+    assert len(plan) == 2
     assert all(run["execution_model"] == "async" for run in plan)
     assert {(run["adapter"], run["scenario"]) for run in plan} == {
         (adapter, scenario)
-        for adapter in ("postgres", "postgres_pool")
-        for scenario in ("read", "create", "flow")
+        for adapter in ("postgres_pool", "event_driven")
+        for scenario in ("flow",)
     }
 
 
@@ -66,6 +65,58 @@ def test_throughput_includes_time_spent_draining_in_flight_work():
     assert result["status"] == "passed"
     assert result["completed_per_s"] == 5
     assert result["execution_model"] == "async"
+
+
+def test_event_variant_splits_the_same_application_cpu_and_memory_budget():
+    plan = list(make_plan(arguments(["--rates", "10", "--repetitions", "1", "--app-cpus", "2"])))
+    for run in plan:
+        assert run["api_cpus"] + run["worker_cpus"] == 2
+        assert run["api_memory_mib"] + run["worker_memory_mib"] == 1024
+        assert run["postgres_cpus"] == run["k6_cpus"] == 1
+    event = next(run for run in plan if run["adapter"] == "event_driven")
+    assert event["api_cpus"] == event["worker_cpus"] == 1
+    assert event["api_workers"] == event["worker_processes"] == 1
+    assert event["persistence_adapter"] == "postgres_pool"
+    assert event["rabbitmq_cpus"] == 1
+
+
+def test_worker_concurrency_is_recorded_and_passed_to_compose(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    experiment = Experiment(arguments(["--worker-concurrency", "3", "--repetitions", "1"]))
+    assert experiment.env["BENCH_WORKER_CONCURRENCY"] == "3"
+    for case in experiment.manifest["plan"]:
+        expected = 3 if case["adapter"] == "event_driven" else 0
+        assert case["worker_concurrency"] == case["worker_prefetch"] == expected
+        assert case["api_cpus"] + case["worker_cpus"] == 2
+
+
+def test_event_reset_purges_messages_and_resets_database_while_consumers_are_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    experiment = Experiment(arguments(["--adapters", "event_driven"]))
+    experiment.current_variant = "event_driven"
+    events = []
+    experiment.quiesce = lambda folder: events.append("quiesce")
+
+    def script(name, *args, **kwargs):
+        assert kwargs["standalone"] is True
+        events.append((name, args[0]))
+
+    experiment.api_script = script
+    experiment.start_api = lambda: events.append("start")
+    experiment.seed()
+    assert events == ["quiesce", ("messaging.py", "reset"), ("database.py", "seed"), "start"]
+
+
+def test_event_quiescence_stops_both_processes_before_waiting_for_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    experiment = Experiment(arguments(["--adapters", "event_driven"]))
+    experiment.current_variant = "event_driven"
+    commands = []
+    experiment.compose_command = lambda *args, **kwargs: commands.append(args)
+    experiment.api_script = lambda *args, **kwargs: commands.append(args)
+    experiment.quiesce(experiment.output / "phase")
+    assert commands[0][-2:] == ("api", "worker")
+    assert commands[1][:2] == ("database.py", "wait-idle")
 
 
 @pytest.mark.parametrize("async_http, async_repository", [(True, True), (False, True), (True, False)])
@@ -166,7 +217,7 @@ def test_dropped_iterations_alone_do_not_require_restarting_a_quiescent_api():
 def test_failed_warmup_is_audited_and_followed_by_measurement(tmp_path, monkeypatch, with_errors, drain_failure):
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "ResourceSampler", lambda *args: nullcontext())
-    experiment = Experiment(arguments(["--adapters", "postgres", "--rates", "50", "--repetitions", "1"]))
+    experiment = Experiment(arguments(["--adapters", "postgres_pool", "--rates", "50", "--repetitions", "1"]))
     events = []
     warmup = summary(dropped=5, completed=99 if with_errors else 100,
                      errors=int(with_errors), unknown=int(with_errors))
@@ -247,7 +298,99 @@ def test_missing_resource_samples_are_explicit_instead_of_implying_zero_usage(tm
 @pytest.mark.parametrize("options", [
     ["--rates", "0"], ["--pool-timeout", "nan"], ["--request-timeout", "inf"],
     ["--preallocated-vus", "30", "--max-vus", "10"], ["--rates", "10", "10"],
+    ["--app-cpus", "0"], ["--command-timeout", "nan"], ["--poll-interval", "0"],
+    ["--poll-interval", "2", "--poll-max-interval", "1"], ["--drain-timeout", "nan"],
+    ["--publish-concurrency", "0"], ["--worker-concurrency", "0"],
+    ["--worker-concurrency", "-1"], ["--scenarios", "read"],
 ])
 def test_invalid_configuration_is_rejected_before_creating_containers(options):
     with pytest.raises(SystemExit):
         arguments(options)
+
+
+def test_queued_results_use_committed_outcomes_not_acceptance_or_k6_completed():
+    data = summary(attempted=10, completed=0)
+    data["benchmark"] = {"version": 4}
+    data["metrics"]["workflows_submitted"] = {"values": {"count": 10}}
+    data["metrics"]["commands_completed"] = {"values": {"count": 20}}
+    audit = {"status": "passed", "counts": {"commands_completed": 30, "commands_failed": 0},
+             "flows": {"attempted": 10, "completed": 10, "elapsed_seconds": 15,
+                       "completion_p50_ms": 500, "completion_p95_ms": 1500,
+                       "completion_p99_ms": 2000, "failed": 0, "pending": 0,
+                       "missing": 0, "incomplete": 0}}
+    row = result_row({"adapter": "event_driven"}, data, audit, 0, 10)
+    assert row["status"] == "passed"
+    assert row["completed"] == 10
+    assert row["completed_per_s"] == 10 / 15
+    assert row["measured_seconds"] == 15
+    assert row["workflow_p95_ms"] == 1500
+    assert row["commands_completed"] == 30
+    assert row["failed_workflows"] == 0
+
+
+def test_v4_without_flow_audit_cannot_pass_even_with_successful_http():
+    data = summary()
+    data["benchmark"] = {"version": 4}
+    assert result_row({}, data, {"status": "passed"}, 0, 10)["status"] == "failed"
+
+
+def test_late_completed_flow_keeps_its_transport_error_visible():
+    data = summary(attempted=1, completed=0, errors=1, unknown=1)
+    data["benchmark"] = {"version": 4}
+    audit = {"status": "passed", "flows": {"attempted": 1, "completed": 1, "elapsed_seconds": 12}}
+    row = result_row({}, data, audit, 99, 10)
+    assert row["completed"] == 1
+    assert row["failed_workflows"] == 0
+    assert row["http_requests_failed"] == row["unknown_writes"] == 1
+    assert row["status"] == "failed"
+
+
+@pytest.mark.parametrize("drain_status", ["passed", "timed_out"])
+def test_worker_drains_after_load_before_stop_and_offline_audit(tmp_path, monkeypatch, drain_status):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "ResourceSampler", lambda *args: nullcontext())
+    experiment = Experiment(arguments(["--adapters", "event_driven"]))
+    experiment.current_variant = "event_driven"
+    folder = experiment.output / "measurement"
+    events = []
+
+    def load(run, destination, duration):
+        events.append("load")
+        (destination / "summary.json").write_text(json.dumps(summary()))
+        return 0
+
+    def script(name, *args, **kwargs):
+        output = experiment.output / args[args.index("--output") + 1].removeprefix("/results/")
+        if name == "database.py":
+            assert args[0] == "drain"
+            assert kwargs["allowed"] == (0, 1)
+            assert kwargs["standalone"] is True
+            events.append("drain")
+            output.write_text(json.dumps({"status": drain_status, "waited_seconds": 2}))
+        else:
+            events.append("inspect")
+            output.write_text(json.dumps({"queues": {"pending": {"ready": 0}, "failed": {"ready": 0}}}))
+
+    def verify(run, destination, *, standalone=False):
+        assert standalone
+        events.append("audit")
+        return {"status": "passed"}
+
+    experiment.load = load
+    experiment.api_script = script
+    experiment.quiesce = lambda destination: events.append("stop")
+    experiment.verify = verify
+    def compose(*args, **kwargs):
+        if args[0] == "stop":
+            assert args[-1] == "api"
+            events.append("stop-api")
+    experiment.compose_command = compose
+    row = experiment.run_phase({"adapter": "event_driven"}, folder, 10)
+    assert events == ["load", "stop-api", "drain", "stop", "audit", "inspect"]
+    assert row["command_drain_status"] == drain_status
+    assert row["status"] == ("passed" if drain_status == "passed" else "failed")
+
+
+def test_removed_connection_per_operation_variant_is_rejected():
+    with pytest.raises(SystemExit):
+        arguments(["--adapters", "postgres"])

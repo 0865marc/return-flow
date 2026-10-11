@@ -18,10 +18,10 @@ from resources import ResourceSampler, sample_coverage
 
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parent
-ADAPTERS = ("postgres", "postgres_pool")
+ADAPTERS = ("postgres_pool", "event_driven")
 EXECUTION_MODEL = "async"
-RESULT_FORMAT_VERSION = 2
-SCENARIOS = ("read", "create", "flow")
+RESULT_FORMAT_VERSION = 5
+SCENARIOS = ("flow",)
 HTTP_COUNTERS = (
     "http_requests_total", "http_requests_succeeded", "http_requests_failed",
     "http_responses_4xx", "http_responses_5xx", "http_transport_errors",
@@ -54,16 +54,31 @@ def arguments(argv=None):
     parser.add_argument("--seed-size", type=positive_int, default=1000)
     parser.add_argument("--pool-size", type=positive_int, default=10)
     parser.add_argument("--pool-timeout", type=positive_float, default=5)
-    parser.add_argument("--preallocated-vus", type=positive_int, default=50)
+    parser.add_argument("--preallocated-vus", type=positive_int, default=200)
     parser.add_argument("--max-vus", type=positive_int, default=200)
     parser.add_argument("--request-timeout", type=positive_float, default=5)
-    parser.add_argument("--smoke", action="store_true", help="short check of all adapters and scenarios")
+    parser.add_argument("--command-timeout", type=positive_float, default=10)
+    parser.add_argument("--poll-interval", type=positive_float, default=0.1,
+                        help="initial backoff after a pending dependency command")
+    parser.add_argument("--poll-max-interval", type=positive_float, default=1,
+                        help="maximum dependency polling backoff in seconds")
+    parser.add_argument("--drain-timeout", type=positive_float, default=30,
+                        help="allow pending commands to finish after generation stops")
+    parser.add_argument("--publish-concurrency", type=positive_int, default=64,
+                        help="maximum in-flight confirmed publications per API process")
+    parser.add_argument("--worker-concurrency", type=positive_int, default=8,
+                        help="maximum concurrent commands in the event worker; also sets prefetch")
+    parser.add_argument("--app-cpus", type=positive_float, default=2, help="application CPU budget; split equally between API and worker for event_driven")
+    parser.add_argument("--api-workers", type=positive_int, default=2, help="API processes for the direct variant; event_driven uses one")
+    parser.add_argument("--smoke", action="store_true", help="short full-flow check of all adapters")
     parser.add_argument("--no-build", action="store_true", help="reuse an existing benchmark API image")
     args = parser.parse_args(argv)
     if args.smoke:
         args.adapters, args.scenarios, args.rates = list(ADAPTERS), list(SCENARIOS), [2]
         args.duration, args.warmup, args.repetitions = 3, 1, 1
         args.preallocated_vus = args.max_vus = 10
+    if args.poll_max_interval < args.poll_interval:
+        parser.error("--poll-max-interval must be >= --poll-interval")
     if args.max_vus < args.preallocated_vus:
         parser.error("--max-vus must be >= --preallocated-vus")
     if args.seed_size > 999999999999:
@@ -80,7 +95,26 @@ def make_plan(args):
         for scenario in args.scenarios:
             for rate in args.rates:
                 for adapter in order:
+                    queued = adapter == "event_driven"
                     yield {"adapter": adapter, "execution_model": EXECUTION_MODEL,
+                           "processing_model": "queued" if queued else "direct",
+                           "persistence_adapter": "postgres_pool",
+                           "idempotency": "transactional_commands",
+                           "application_cpus": args.app_cpus,
+                           "api_cpus": args.app_cpus / 2 if queued else args.app_cpus,
+                           "worker_cpus": args.app_cpus / 2 if queued else 0,
+                           "api_workers": 1 if queued else args.api_workers,
+                           "worker_processes": 1 if queued else 0,
+                           "worker_concurrency": args.worker_concurrency if queued else 0,
+                           "worker_prefetch": args.worker_concurrency if queued else 0,
+                           "api_pool_autocommit": True,
+                           "worker_pool_autocommit": False if queued else None,
+                           "skip_intermediate_drain": queued,
+                           "api_healthcheck_interval": "30s",
+                           "api_memory_mib": 512 if queued else 1024,
+                           "worker_memory_mib": 512 if queued else 0,
+                           "postgres_cpus": 1, "rabbitmq_cpus": 1 if queued else 0,
+                           "k6_cpus": 1, "publish_concurrency": args.publish_concurrency if queued else 0,
                            "scenario": scenario, "rate": rate, "repetition": repetition}
 
 
@@ -98,9 +132,15 @@ class Experiment:
         self.output.mkdir(parents=True)
         self.env = dict(os.environ, BENCH_OUTPUT_DIR=str(self.output),
                         BENCH_UID=str(os.getuid()), BENCH_GID=str(os.getgid()),
-                        BENCH_POOL_SIZE=str(args.pool_size), BENCH_POOL_TIMEOUT=str(args.pool_timeout))
-        self.compose = ["docker", "compose", "--project-name", self.project, "--file", str(ROOT / "compose.yml")]
+                        BENCH_POOL_SIZE=str(args.pool_size), BENCH_POOL_TIMEOUT=str(args.pool_timeout),
+                        BENCH_PUBLISH_CONCURRENCY=str(args.publish_concurrency),
+                        BENCH_WORKER_CONCURRENCY=str(args.worker_concurrency))
+        # Enable the profile for cleanup/logging too. Explicit `up api` still
+        # starts only API + PostgreSQL, while `down` must remove old consumers.
+        self.compose = ["docker", "compose", "--profile", "events", "--profile", "load", "--project-name", self.project,
+                        "--file", str(ROOT / "compose.yml")]
         self.rows = []
+        self.current_variant = "postgres_pool"
         self.manifest = {"id": self.identifier, "project": self.project, "configuration": vars(args),
                          "execution_model": EXECUTION_MODEL,
                          "result_format_version": RESULT_FORMAT_VERSION,
@@ -126,7 +166,14 @@ class Experiment:
         return self.compose_command(*prefix, "api", "python", f"/benchmarks/{script}", *args, **kwargs)
 
     def seed(self):
-        self.api_script("database.py", "seed", "--size", str(self.args.seed_size))
+        queued = self.current_variant == "event_driven"
+        if queued:
+            # No old message may execute after the database is reset.
+            self.quiesce(self.output / "reset")
+            self.api_script("messaging.py", "reset", standalone=True)
+        self.api_script("database.py", "seed", "--size", str(self.args.seed_size), standalone=queued)
+        if queued:
+            self.start_api()
 
     def verify_execution_model(self):
         # --no-build may point to an image from the previous synchronous implementation.
@@ -153,6 +200,9 @@ asyncio.run(verify())
         relative = folder.relative_to(self.output).as_posix()
         folder.mkdir(parents=True, exist_ok=True)
         settings = {"SCENARIO": run["scenario"], "RATE": run["rate"], "DURATION": f"{duration}s",
+                    "VARIANT": run["adapter"], "COMMAND_TIMEOUT": self.args.command_timeout,
+                    "POLL_INTERVAL": self.args.poll_interval,
+                    "POLL_MAX_INTERVAL": self.args.poll_max_interval,
                     "PREALLOCATED_VUS": self.args.preallocated_vus, "MAX_VUS": self.args.max_vus,
                     "REQUEST_TIMEOUT": f"{self.args.request_timeout}s", "SEED_SIZE": self.args.seed_size,
                     "SUMMARY_PATH": f"/results/{relative}/summary.json"}
@@ -162,7 +212,7 @@ asyncio.run(verify())
             "k6", "run", "--quiet", "--log-format", "raw", "--console-output",
             f"/results/{relative}/receipts.log", "/scenarios/load.js",
             log=folder / "k6.log", allowed=(0, 99),
-            timeout=duration + math.ceil(4 * self.args.request_timeout) + 90,
+            timeout=duration + math.ceil(3 * self.args.request_timeout + 2 * self.args.command_timeout) + 90,
         )
         if not (folder / "summary.json").is_file():
             raise RuntimeError(f"k6 did not produce a summary in {folder}")
@@ -171,6 +221,7 @@ asyncio.run(verify())
     def verify(self, run, folder, *, standalone=False):
         relative = folder.relative_to(self.output).as_posix()
         self.api_script("database.py", "verify", "--size", str(self.args.seed_size),
+                        "--variant", run["adapter"],
                         "--scenario", run["scenario"], "--summary", f"/results/{relative}/summary.json",
                         "--receipts", f"/results/{relative}/receipts.log",
                         "--output", f"/results/{relative}/verification.json", allowed=(0, 1),
@@ -178,12 +229,15 @@ asyncio.run(verify())
         return json.loads((folder / "verification.json").read_text())
 
     def start_api(self):
-        self.compose_command("up", "-d", "--no-build", "--wait", "--wait-timeout", "60", "api")
+        services = ("api", "worker") if self.current_variant == "event_driven" else ("api",)
+        self.compose_command("up", "-d", "--no-build", "--wait", "--wait-timeout", "90", *services)
 
     def quiesce(self, folder):
+        folder.mkdir(parents=True, exist_ok=True)
         # Stop request handling before auditing ambiguous writes or clearing data.
         timeout = math.ceil(4 * self.args.request_timeout + 10)
-        self.compose_command("stop", "--timeout", str(timeout), "api", timeout=timeout + 30)
+        services = ("api", "worker") if self.current_variant == "event_driven" else ("api",)
+        self.compose_command("stop", "--timeout", str(timeout), *services, timeout=timeout + 30)
         relative = folder.relative_to(self.output).as_posix()
         self.api_script("database.py", "wait-idle", "--timeout", str(timeout),
                         "--output", f"/results/{relative}/drain.json", standalone=True,
@@ -191,18 +245,49 @@ asyncio.run(verify())
 
     def run_phase(self, run, folder, duration):
         folder.mkdir(parents=True, exist_ok=True)
+        queued = run["adapter"] == "event_driven"
+        command_drain = None
         with ResourceSampler(self.project, folder / "resources.jsonl"):
             code = self.load(run, folder, duration)
+            if queued:
+                # A client timeout may leave an HTTP handler running. Stop API
+                # producers first while the worker still consumes, then drain.
+                stop_timeout = math.ceil(3 * self.args.request_timeout + 10)
+                self.compose_command("stop", "--timeout", str(stop_timeout), "api",
+                                     timeout=stop_timeout + 30)
+                relative = folder.relative_to(self.output).as_posix()
+                self.api_script("database.py", "drain", "--timeout", str(self.args.drain_timeout),
+                                "--output", f"/results/{relative}/command-drain.json",
+                                standalone=True, allowed=(0, 1), timeout=self.args.drain_timeout + 30)
+                command_drain = json.loads((folder / "command-drain.json").read_text())
+                if command_drain.get("status") not in {"passed", "timed_out"}:
+                    raise RuntimeError(f"Command drain failed: {command_drain}")
         summary = json.loads((folder / "summary.json").read_text())
-        stopped = requires_quiescence(summary)
+        stopped = queued or requires_quiescence(summary)
         if stopped:
             self.quiesce(folder)
         verification = self.verify(run, folder, standalone=stopped)
         row = result_row(run, summary, verification, code, duration)
         row["api_stopped"] = stopped
-        coverage = sample_coverage(folder / "resources.jsonl")
+        row["command_drain_status"] = command_drain["status"] if command_drain else None
+        row["command_drain_seconds"] = command_drain["waited_seconds"] if command_drain else None
+        if command_drain and command_drain["status"] != "passed":
+            row["status"] = "failed"
+        if queued:
+            relative = folder.relative_to(self.output).as_posix()
+            self.api_script("messaging.py", "inspect", "--output", f"/results/{relative}/queues.json", standalone=True)
+            queues = json.loads((folder / "queues.json").read_text())["queues"]
+            row["queue_ready"] = queues["pending"]["ready"]
+            row["dead_letter_ready"] = queues["failed"]["ready"]
+        else:
+            row["queue_ready"] = row["dead_letter_ready"] = None
+        coverage = sample_coverage(folder / "resources.jsonl", include_messaging=queued)
         write_json(folder / "resource-coverage.json", coverage)
         row["resource_warnings"] = len(coverage["warnings"])
+        for service in ("api", "worker", "postgres", "rabbitmq", "k6"):
+            usage = coverage["cpu_percent"].get(service, {})
+            row[f"{service}_cpu_mean_percent"] = usage.get("mean")
+            row[f"{service}_cpu_max_percent"] = usage.get("max")
         self.compose_command("logs", "--no-color", "--tail", "200", log=folder / "services.log")
         write_json(folder / "result.json", row)
         return row
@@ -216,8 +301,11 @@ asyncio.run(verify())
                 print("Building benchmark API image…", flush=True)
                 self.compose_command("build", "api", timeout=600)
             self.compose_command("pull", "postgres", "k6", timeout=600)
+            if "event_driven" in self.args.adapters:
+                self.compose_command("pull", "rabbitmq", timeout=600)
             images = self.command([
                 "docker", "image", "inspect", "return-flow-benchmark-api:local", "postgres:17-alpine", "grafana/k6:1.6.1",
+                *(["rabbitmq:4-alpine"] if "event_driven" in self.args.adapters else []),
                 "--format", "{{json .}}",
             ]).stdout
             self.manifest["images"] = [json.loads(line) for line in images.splitlines() if line]
@@ -229,7 +317,13 @@ asyncio.run(verify())
                 folder.mkdir()
                 write_json(folder / "configuration.json", dict(run, duration=self.args.duration))
                 print(f"[{position}/{len(self.manifest['plan'])}] {name}", flush=True)
-                self.env["BENCH_ADAPTER"] = run["adapter"]
+                self.current_variant = run["adapter"]
+                self.env.update(BENCH_API_CPUS=str(run["api_cpus"]),
+                                BENCH_WORKER_CPUS=str(run["worker_cpus"] or 1),
+                                BENCH_API_WORKERS=str(run["api_workers"]),
+                                BENCH_API_MEMORY=f"{run['api_memory_mib']}m",
+                                BENCH_RABBITMQ_URL="amqp://benchmark:benchmark@rabbitmq:5672/" if run["adapter"] == "event_driven" else "")
+                self.compose_command("config", log=folder / "compose.resolved.yml")
                 # Recreate only this isolated stack so each run starts with a fresh database.
                 self.compose_command("down", "--volumes", "--remove-orphans")
                 self.start_api()
@@ -237,20 +331,24 @@ asyncio.run(verify())
                     self.verify_execution_model()
                     self.seed()
                     destination = f"reliability-{run['adapter']}.json"
-                    self.api_script("reliability.py", "--output", f"/results/{destination}", allowed=(0, 1))
+                    self.api_script("reliability.py", "--variant", run["adapter"], "--output", f"/results/{destination}", allowed=(0, 1))
                     reliability[run["adapter"]] = json.loads((self.output / destination).read_text())["status"]
                 if reliability[run["adapter"]] != "passed":
                     # Functional preflight failures are not load measurements.
                     verification = {"status": "not_run", "errors": ["reliability_failed; measurement skipped."]}
                     write_json(folder / "verification.json", verification)
                     row = result_row(run, None, verification, 1, self.args.duration)
-                    row.update(status="reliability_failed", api_stopped=None, resource_warnings=None)
+                    row.update(status="reliability_failed", api_stopped=None, resource_warnings=None,
+                               queue_ready=None, dead_letter_ready=None,
+                               command_drain_status=None, command_drain_seconds=None)
+                    for service in ("api", "worker", "postgres", "rabbitmq", "k6"):
+                        row[f"{service}_cpu_mean_percent"] = row[f"{service}_cpu_max_percent"] = None
                     warmup = result_row(run, None, verification, 1, self.args.warmup)
                     warmup["api_stopped"] = None
                 else:
                     self.seed()
                     warmup = self.run_phase(run, folder / "warmup", self.args.warmup)
-                    if warmup["api_stopped"]:
+                    if warmup["api_stopped"] and run["adapter"] != "event_driven":
                         self.start_api()
                     # All warmup requests completed, or the old API has stopped and
                     # its database sessions have drained. Its failures stay recorded.
@@ -262,6 +360,7 @@ asyncio.run(verify())
                     row[f"warmup_{key}"] = warmup[key]
                 row["warmup_recovery"] = (
                     "not_run" if warmup["api_stopped"] is None else
+                    "api_and_worker_restarted" if warmup["api_stopped"] and run["adapter"] == "event_driven" else
                     "api_restarted" if warmup["api_stopped"] else "none"
                 )
                 row["reliability"] = reliability[run["adapter"]]
@@ -313,10 +412,23 @@ asyncio.run(verify())
             writer = csv.DictWriter(stream, fieldnames=list(self.rows[0]))
             writer.writeheader()
             writer.writerows(self.rows)
-        lines = ["# Persistence comparison", "", "Execution model: `async` (HTTP, use cases and PostgreSQL).",
-                 "Both adapters use the same application code; only connection management changes.",
+        lines = ["# Delivery and return comparison", "", "Execution model: `async` (Python HTTP, use cases and PostgreSQL).",
+                 "Only complete delivery → delivered → return workflows are compared; outcomes are reconciled after load.",
+                 "CPU budget is for application processes; PostgreSQL has 1 CPU and RabbitMQ adds 1 CPU for event_driven.",
+                 "Application memory: 1 GiB for direct API; 512 MiB API + 512 MiB worker for event_driven.",
+                 "Both variants use postgres_pool and the same transactional command idempotency.",
+                 "Event worker concurrency is bounded and configurable; prefetch equals concurrency (see configuration).",
+                 "Both API pools use autocommit for standalone reads; command writes remain in explicit transactions.",
+                 "Publisher confirmations are awaited without the intermediate local writer-drain wait.",
+                 "API healthchecks use a 30-second interval after fast startup checks, with cached Python imports.",
+                 "Only two dependent commands are polled, with bounded exponential backoff; the last command is never polled.",
+                 "No final resource GET runs during load. Dependency polling still adds HTTP/SQL work and real E2E waiting.",
+                 "The event publisher has bounded concurrent confirmations; the per-process limit is recorded in configuration.",
                  "Each row is one run; warmup is reported separately and does not gate measurement.",
-                 "Throughput uses k6 measurement time including draining in-flight requests.",
+                 "Throughput uses the offered load window extended to the last flow completion or generator attempt finish.",
+                 "E2E latency starts at the first request and ends at the return transaction COMMIT in every variant.",
+                 "PostgreSQL track_commit_timestamp is enabled only in this benchmark, equally for all variants.",
+                 "DB and generator use the shared Docker host clock. Format v5 adds direct command idempotency; previous v4/v3 measurements are not comparable.",
                  "Percentiles describe individual runs, not an average across repetitions.", "",
                  "## Measurements", "",
                  "| Adapter | Scenario | Offered iterations/s | Rep | Completed/s | Workflow p95 ms | Failed HTTP / started | HTTP failure % | Incomplete flows | Not started | Audit | Result |",
@@ -337,6 +449,30 @@ asyncio.run(verify())
             )]
             lines.append(f"| {row['adapter']} | {row['scenario']} | {row['rate']} | {row['repetition']} | "
                          + " | ".join(counts) + " |")
+        lines.extend(["", "## Resources and queued commands (measurement)", "",
+                      "CPU samples use 100% per logical CPU. Missing samples are N/A, not zero.",
+                      "Queued work is inspected after stopping API/worker; it is not a snapshot at the end of offered load.",
+                      "| Variant | Rate | Rep | API CPUs / processes | Worker CPUs | Worker concurrency / prefetch | Mean CPU % API / worker / DB / broker / k6 | Commands submitted / completed / failed / dependency timeouts | DB pending / missing | Queue ready / failed |",
+                      "|---|---:|---:|---|---:|---|---|---|---:|---|"])
+        for row in self.rows:
+            cpu = " / ".join(display(row.get(f"{service}_cpu_mean_percent"), 1)
+                             for service in ("api", "worker", "postgres", "rabbitmq", "k6"))
+            commands = " / ".join(display(row.get(f"commands_{state}"))
+                                  for state in ("submitted", "completed", "failed", "timed_out"))
+            lines.append(f"| {row['adapter']} | {row['rate']} | {row['repetition']} | "
+                         f"{row.get('api_cpus', 'N/A')} / {row.get('api_workers', 'N/A')} | "
+                         f"{row.get('worker_cpus', 'N/A')} | "
+                         f"{row.get('worker_concurrency', 'N/A')} / {row.get('worker_prefetch', 'N/A')} | {cpu} | {commands} | "
+                         f"{display(row.get('commands_pending_db'))} / {display(row.get('commands_missing_db'))} | "
+                         f"{display(row.get('queue_ready'))} / {display(row.get('dead_letter_ready'))} |")
+        lines.extend(["", "## Flow outcomes after drain", "",
+                      "These categories partition incomplete flows; pending or missing is not proof of permanent loss.",
+                      "| Variant | Rate | Rep | Failed | Pending | Missing commands | Partial / unconfirmed | Drain |",
+                      "|---|---:|---:|---:|---:|---:|---:|---|"])
+        for row in self.rows:
+            lines.append(f"| {row['adapter']} | {row['rate']} | {row['repetition']} | "
+                         + " | ".join(display(row.get(key)) for key in
+                                      ("flows_failed", "flows_pending", "flows_missing", "flows_incomplete", "command_drain_status")) + " |")
         lines.extend(["", "## Warmup (excluded from measurements)", "",
                       "| Adapter | Scenario | Rate | Rep | Completed / attempted | Failed HTTP / started | HTTP failure % | Not started | Ambiguous writes | Audit | Result | Recovery |",
                       "|---|---|---:|---:|---|---|---:|---:|---:|---|---|---|"])
@@ -351,8 +487,11 @@ asyncio.run(verify())
                       "HTTP failure % = classified failed requests / requests started. Unfinished HTTP is reported separately.",
                       "Incomplete flows = attempted - completed. Not started = k6 dropped iterations, not server rejections.",
                       "4xx, 5xx, transport and unexpected responses partition classified failures; timeouts are a subset of transport.",
-                      "Ambiguous writes overlap failed requests and do not prove data loss.",
+                      "Ambiguous HTTP writes overlap failed requests; the offline audit may still confirm a completed flow.",
+                      "Terminal DB command counts include late outcomes after generation. Timeouts concern dependency observation only.",
+                      "A queued 202 is submission, never a completed flow. All three results and business relationships must match.",
                       "`api_restarted` means recovery required restarting the API after warmup; its process/pool is no longer warm.",
+                      "`api_and_worker_restarted` is the mandatory event reset; accepted messages cannot cross into the next phase.",
                       "`passed` means no correctness/load-generation errors in the measurement; no latency SLA was set.",
                       "A failed warmup stays visible but does not by itself fail a successful measurement.",
                       "Expected 409 conflicts are checked separately in reliability-*.json.",
@@ -399,8 +538,11 @@ def result_row(run, summary, verification, returncode, duration):
         for metric in metrics.values() for threshold in metric.get("thresholds", {}).values()
     )
     elapsed = (summary or {}).get("state", {}).get("testRunDurationMs", 0) / 1000 if measured else None
-    attempted = value("workflows_attempted", "count")
-    completed = value("workflows_completed", "count")
+    flows = verification.get("flows", {})
+    attempted = flows.get("attempted", value("workflows_attempted", "count"))
+    completed = flows.get("completed", value("workflows_completed", "count"))
+    elapsed = flows.get("elapsed_seconds", elapsed)
+    requires_flow_audit = (summary or {}).get("benchmark", {}).get("version", 0) >= 4
     http = {name: value(name, "count", None) for name in HTTP_COUNTERS}
     counts_present = all(isinstance(n, (int, float)) and math.isfinite(n) and n >= 0 and int(n) == n
                          for n in http.values())
@@ -410,6 +552,7 @@ def result_row(run, summary, verification, returncode, duration):
         "http_responses_4xx", "http_responses_5xx", "http_transport_errors", "http_unexpected_responses"
     )) if counts_present else None
     valid = (measured and returncode == 0 and thresholds_ok and verification["status"] == "passed"
+             and (not requires_flow_audit or bool(flows))
              and elapsed > 0 and completed > 0 and attempted == completed
              and value("technical_errors", "count") == 0
              and value("unknown_writes", "count") == 0
@@ -426,8 +569,21 @@ def result_row(run, summary, verification, returncode, duration):
                 measured_seconds=elapsed, configured_seconds=duration,
                 actual_http_per_s=value("http_reqs", "rate"), http_p50_ms=value("http_req_duration", "med", ""),
                 http_p95_ms=value("http_req_duration", "p(95)", ""), http_p99_ms=value("http_req_duration", "p(99)", ""),
-                workflow_p50_ms=value("workflow_duration", "med", ""), workflow_p95_ms=value("workflow_duration", "p(95)", ""),
-                workflow_p99_ms=value("workflow_duration", "p(99)", ""),
+                workflow_p50_ms=flows.get("completion_p50_ms", value("workflow_duration", "med", "")),
+                workflow_p95_ms=flows.get("completion_p95_ms", value("workflow_duration", "p(95)", "")),
+                workflow_p99_ms=flows.get("completion_p99_ms", value("workflow_duration", "p(99)", "")),
+                flows_failed=flows.get("failed"), flows_pending=flows.get("pending"),
+                flows_missing=flows.get("missing"), flows_incomplete=flows.get("incomplete"),
+                workflows_submitted=value("workflows_submitted", "count"),
+                commands_submitted=value("commands_submitted", "count"),
+                commands_completed=verification.get("counts", {}).get("commands_completed", value("commands_completed", "count")),
+                commands_failed=verification.get("counts", {}).get("commands_failed", value("commands_failed", "count")),
+                commands_timed_out=value("commands_timed_out", "count"),
+                commands_pending_db=verification.get("counts", {}).get("commands_pending"),
+                commands_missing_db=verification.get("counts", {}).get("commands_missing"),
+                create_acceptance_p95_ms=value("create_delivery_async_duration", "p(95)", ""),
+                deliver_acceptance_p95_ms=value("deliver_delivery_async_duration", "p(95)", ""),
+                return_acceptance_p95_ms=value("create_return_async_duration", "p(95)", ""),
                 technical_errors=value("technical_errors", "count"), unknown_writes=value("unknown_writes", "count"),
                 dropped_iterations=value("dropped_iterations", "count"))
 

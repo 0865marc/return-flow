@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:17-alpine
+    command: ["postgres", "-c", "track_commit_timestamp=on"]
     environment:
       POSTGRES_DB: return_flow_benchmark
       POSTGRES_USER: benchmark
@@ -18,15 +19,17 @@ services:
   api:
     image: return-flow-benchmark-api:local
     build: ../api
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${BENCH_API_WORKERS:-2}", "--no-access-log"]
     user: "${BENCH_UID:?Run benchmarks/run.py}:${BENCH_GID:?Run benchmarks/run.py}"
     environment:
       DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/return_flow_benchmark
-      PERSISTENCE_ADAPTER: ${BENCH_ADAPTER:-postgres}
       DATABASE_POOL_MAX_SIZE: ${BENCH_POOL_SIZE:-10}
       DATABASE_POOL_TIMEOUT: ${BENCH_POOL_TIMEOUT:-5}
-    cpus: 1.0
-    mem_limit: 512m
+      RABBITMQ_URL: ${BENCH_RABBITMQ_URL:-}
+      RABBITMQ_PUBLISH_CONCURRENCY: ${BENCH_PUBLISH_CONCURRENCY:-64}
+      RABBITMQ_QUEUE: return_flow.benchmark.commands
+    cpus: ${BENCH_API_CPUS:-2.0}
+    mem_limit: ${BENCH_API_MEMORY:-1g}
     volumes:
       - ./:/benchmarks:ro
       - ${BENCH_OUTPUT_DIR:?Run benchmarks/run.py}:/results
@@ -35,9 +38,46 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
-      interval: 1s
+      interval: 30s
+      start_period: 30s
+      start_interval: 1s
       timeout: 3s
+      retries: 3
+
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    profiles: ["events"]
+    environment:
+      RABBITMQ_DEFAULT_USER: benchmark
+      RABBITMQ_DEFAULT_PASS: benchmark
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 1:1"
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
       retries: 30
+
+  worker:
+    image: return-flow-benchmark-api:local
+    profiles: ["events"]
+    command: ["python", "worker.py"]
+    user: "${BENCH_UID:?Run benchmarks/run.py}:${BENCH_GID:?Run benchmarks/run.py}"
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/return_flow_benchmark
+      DATABASE_POOL_MAX_SIZE: ${BENCH_POOL_SIZE:-10}
+      DATABASE_POOL_TIMEOUT: ${BENCH_POOL_TIMEOUT:-5}
+      RABBITMQ_URL: amqp://benchmark:benchmark@rabbitmq:5672/
+      RABBITMQ_QUEUE: return_flow.benchmark.commands
+      RABBITMQ_WORKER_CONCURRENCY: ${BENCH_WORKER_CONCURRENCY:-8}
+    cpus: ${BENCH_WORKER_CPUS:-1.0}
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
   k6:
     image: grafana/k6:1.6.1

@@ -1,9 +1,17 @@
 # Evaluación de rendimiento y fiabilidad
 
-Este evaluador compara `postgres` (una conexión asíncrona por operación) y
-`postgres_pool` (pool de conexiones asíncronas). Ambas variantes comparten rutas,
-casos de uso y puertos con `async/await`, además de las mismas consultas y reglas
-del negocio. Solo cambia cómo se obtienen y liberan las conexiones a PostgreSQL.
+Este evaluador compara dos variantes del mismo flujo de entrega y devolución:
+
+- `postgres_pool`: peticiones que terminan la operación antes de responder,
+  utilizando conexiones asíncronas reutilizadas e idempotencia transaccional.
+- `event_driven`: las escrituras se aceptan como comandos, RabbitMQ las entrega
+  al worker y el cliente consulta solo los dos resultados necesarios para avanzar
+  al siguiente paso. La finalización de la devolución se comprueba después de la
+  carga en PostgreSQL. API y worker usan `postgres_pool`, con el mismo dominio y
+  casos de uso.
+
+Las dos variantes utilizan `async/await`. Aquí «directo» significa que la
+operación termina dentro de la petición HTTP; no implica código Python bloqueante.
 
 Se ejecuta desde la terminal y guarda archivos locales. No necesita un servidor
 Grafana, una cuenta ni un servicio permanente de monitorización. k6 es el programa
@@ -15,19 +23,24 @@ que genera las peticiones HTTP; lo ejecutamos en un contenedor temporal.
 python3 benchmarks/run.py
     │
     ├── Arranca un entorno de evaluación con Docker Compose
-    │       ├── FastAPI con el adaptador seleccionado
-    │       └── PostgreSQL con una base de datos dedicada
+    │       ├── FastAPI con persistencia PostgreSQL mediante pool
+    │       ├── PostgreSQL con una base de datos dedicada
+    │       └── RabbitMQ y worker, solo en event_driven
     │
     ├── Prepara datos y comprueba conflictos y solicitudes repetidas
-    ├── Ejecuta k6 ── HTTP ──► FastAPI ── SQL ──► PostgreSQL
+    ├── Ejecuta k6: crear entrega → entregar → solicitar devolución
+    ├── En eventos, deja terminar el trabajo pendiente con un límite de espera
+    ├── Audita los flujos completos y calcula latencias y rendimiento
     ├── Recoge consumo de recursos y comprueba los datos guardados
-    ├── Repite con el siguiente adaptador
+    ├── Repite con la siguiente variante
     └── Guarda los resultados y elimina los contenedores de evaluación
 ```
 
 `run.py` coordina el experimento desde tu máquina usando la biblioteca estándar
-de Python. k6 mide la experiencia del cliente. Los auxiliares de preparación y
-verificación se ejecutan dentro del contenedor de la API, aprovechando psycopg.
+de Python. k6 registra las solicitudes y un recibo por cada flujo iniciado. Los
+auxiliares de preparación y verificación se ejecutan dentro del contenedor de la
+API, aprovechando psycopg. El resultado principal es el flujo completo auditado,
+no la cantidad de respuestas HTTP ni de comandos aceptados.
 
 El entorno usa `benchmarks/compose.yml` con un nombre de proyecto único
 `return-flow-bench-<id>`. Su base de datos es `return_flow_benchmark`: no utiliza
@@ -36,9 +49,35 @@ crea un volumen propio para PostgreSQL y lo elimina antes de la siguiente; al
 terminar el experimento también se elimina. Los resultados permanecen en el disco
 de tu máquina.
 
-Cada contenedor tiene un límite de 1 CPU y 512 MiB de memoria. La API arranca con
-un proceso, sin recarga automática y sin registrar cada petición HTTP. No se
-necesita RabbitMQ para esta comparación.
+El presupuesto predeterminado de **aplicación** es de 2 CPU y 1 GiB de memoria:
+
+| Variante | API | Worker | PostgreSQL | RabbitMQ | k6 |
+|---|---|---|---|---|---|
+| `postgres_pool` | 2 CPU, 1 GiB, 2 procesos | — | 1 CPU, 512 MiB | — | 1 CPU, 512 MiB |
+| `event_driven` | 1 CPU, 512 MiB, 1 proceso | 1 CPU, 512 MiB, 1 proceso | 1 CPU, 512 MiB | 1 CPU, 512 MiB | 1 CPU, 512 MiB |
+
+PostgreSQL y el generador quedan fuera del presupuesto de aplicación. RabbitMQ
+añade infraestructura a `event_driven`: los servicios de esa variante suman
+4 CPU frente a 3 CPU en la directa, sin contar k6. La API se ejecuta sin recarga
+automática ni registro de cada petición HTTP.
+
+`--app-cpus` cambia el presupuesto de aplicación; en eventos se reparte por igual
+entre API y worker. `--api-workers` configura los procesos de la variante
+directa; eventos mantiene un proceso de API y un worker. El worker procesa hasta
+ocho comandos simultáneos por defecto; `--worker-concurrency` ajusta ese límite y
+el prefetch al mismo valor. Las tareas siguen compartiendo la CPU asignada al
+worker. El publicador
+permite hasta 64 publicaciones pendientes de confirmación por proceso de API;
+`--publish-concurrency` ajusta ese límite. Cada POST sigue esperando su propia
+confirmación de RabbitMQ antes de responder `202`, usando `wait=False` para evitar
+la espera intermedia de escritura local bajo el bloqueo del canal. El registro
+previo del comando en PostgreSQL y la idempotencia transaccional se mantienen.
+
+Los pools de ambas API usan autocommit para lecturas aisladas; las escrituras de
+comandos conservan sus transacciones explícitas y el pool del worker mantiene su
+configuración transaccional. El healthcheck de la API se ejecuta cada segundo
+durante el arranque y cada 30 segundos después; la imagen precalcula el bytecode
+de sus importaciones para reducir el coste dentro de la cuota de CPU de la API.
 
 ## Ejecutar
 
@@ -52,10 +91,11 @@ Desde la raíz del proyecto, empieza por una comprobación corta:
 python3 benchmarks/run.py --smoke
 ```
 
-Esta prueba ejecuta los dos adaptadores y los tres escenarios, a 2 operaciones por
-segundo, con 1 segundo de calentamiento, 3 de medición y una repetición. Comprueba
-que el evaluador funciona; es demasiado corta para concluir qué adaptador rinde
-mejor. Son seis mediciones.
+Esta prueba ejecuta el flujo completo en las dos variantes, a 2 flujos por
+segundo, con 1 segundo de calentamiento, 3 de medición y una repetición. Utiliza
+10 usuarios virtuales preparados y como máximo. Comprueba que el evaluador
+funciona; es demasiado corta para concluir qué adaptador rinde mejor. Son dos
+mediciones.
 
 Después, ejecuta la comparación predeterminada del flujo completo:
 
@@ -63,7 +103,7 @@ Después, ejecuta la comparación predeterminada del flujo completo:
 python3 benchmarks/run.py
 ```
 
-Evalúa `flow` con los dos adaptadores, a 10, 50 y 400 operaciones por segundo, con
+Evalúa `flow` con las dos variantes, a 10, 50 y 400 flujos por segundo, con
 5 segundos de calentamiento, 30 de medición y tres repeticiones. Son 18
 mediciones previstas. También se miden las configuraciones que incumplan los
 umbrales durante el calentamiento. Abre el `report.md` de la carpeta de resultados
@@ -73,78 +113,132 @@ La selección explícita equivalente es:
 
 ```bash
 python3 benchmarks/run.py \
-  --adapters postgres postgres_pool \
+  --adapters postgres_pool event_driven \
+  --app-cpus 2 --api-workers 2 \
   --rates 10 50 400 \
   --warmup 5 \
   --duration 30 \
   --repetitions 3
 ```
 
-Se conservan los mismos límites de recursos y un proceso de API. El pool mantiene
-una conexión como mínimo y permite configurar el máximo y el tiempo de espera.
-Esta comparación mide el efecto conjunto de reutilizar conexiones y limitar
-cuántas operaciones pueden utilizarlas a la vez; la variante sin pool abre una
-conexión por operación y no impone ese límite adicional.
-
-Para elegir otros ritmos, ampliar los escenarios y prolongar las mediciones:
+Para una primera comparación más corta con 2 CPU de aplicación, esta matriz hace
+12 mediciones de 20 segundos, además de los calentamientos y verificaciones:
 
 ```bash
 python3 benchmarks/run.py \
-  --adapters postgres postgres_pool \
-  --scenarios read create flow \
+  --adapters postgres_pool event_driven \
+  --app-cpus 2 --api-workers 2 \
+  --scenarios flow --rates 10 50 400 \
+  --warmup 3 --duration 20 --repetitions 2
+```
+
+El pool mantiene una conexión como mínimo **por proceso**. Con el máximo
+predeterminado de 10 y dos procesos de API, `postgres_pool` puede abrir hasta
+20 conexiones. En eventos hay un pool en la API y otro en el worker, también
+con máximo 10 cada uno; el worker ejecuta hasta ocho comandos simultáneos por
+defecto. Aumentar su concurrencia por encima del pool puede añadir esperas por
+conexiones, por lo que ambos límites deben ajustarse conjuntamente.
+Las dos variantes utilizan el mismo almacenamiento y ejecutor de comandos:
+registran la clave, bloquean el comando y confirman su resultado junto con la
+escritura de negocio en una transacción. La variante directa ejecuta dentro de la
+petición; la otra publica en RabbitMQ y ejecuta en el worker. Se compara el coste
+del transporte y seguimiento del trabajo con la misma garantía de idempotencia.
+La persistencia no tiene un selector de adaptadores.
+
+Para elegir otros ritmos y prolongar las mediciones:
+
+```bash
+python3 benchmarks/run.py \
+  --adapters postgres_pool event_driven \
+  --scenarios flow \
   --rates 10 50 100 \
   --warmup 30 \
   --duration 120 \
   --repetitions 3
 ```
 
-Cada combinación de adaptador, escenario, ritmo y repetición es una ejecución
-independiente. El ejemplo anterior realiza 54 mediciones, además de sus
-calentamientos: reserva tiempo suficiente.
+Cada combinación de adaptador, ritmo y repetición es una ejecución independiente.
+El ejemplo anterior realiza 18 mediciones, además de sus calentamientos: reserva
+tiempo suficiente. Solo se admite `flow`; `read` y `create` ya no son escenarios
+de este evaluador.
 
 | Argumento | Valor por defecto | Qué controla |
 |---|---|---|
-| `--adapters` | `postgres postgres_pool` | Adaptadores asíncronos que se comparan. |
-| `--scenarios` | `flow` | Escenarios; admite `read`, `create` y `flow`. |
-| `--rates` | `10 50 400` | Operaciones iniciadas por segundo, no peticiones HTTP. |
+| `--adapters` | `postgres_pool event_driven` | Variantes que se comparan. |
+| `--app-cpus` | `2` | CPU de aplicación: todo para API directa; mitad API y mitad worker en eventos. |
+| `--api-workers` | `2` | Procesos de API directa; eventos utiliza uno. |
+| `--scenarios` | `flow` | Único escenario admitido: flujo completo de entrega y devolución. |
+| `--rates` | `10 50 400` | Flujos que se intenta iniciar por segundo, no peticiones HTTP. |
 | `--duration` | `30` | Segundos de medición por ejecución. |
 | `--warmup` | `5` | Segundos de calentamiento antes de medir. |
 | `--repetitions` | `3` | Repeticiones de cada combinación. |
 | `--seed-size` | `1000` | Entregas iniciales del conjunto de datos. |
-| `--pool-size` | `10` | Máximo de conexiones del adaptador con pool. |
+| `--pool-size` | `10` | Máximo de conexiones del adaptador con pool, por proceso. |
 | `--pool-timeout` | `5` | Segundos máximos para esperar una conexión del pool. |
-| `--preallocated-vus` | `50` | Usuarios virtuales preparados al iniciar k6. |
+| `--preallocated-vus` | `200` | Usuarios virtuales preparados al iniciar k6. |
 | `--max-vus` | `200` | Límite de usuarios virtuales de k6. |
 | `--request-timeout` | `5` | Tiempo máximo en segundos por petición HTTP. |
+| `--command-timeout` | `10` | Espera máxima en segundos para cada uno de los dos comandos de los que depende el siguiente paso. |
+| `--poll-interval` | `0.1` | Espera inicial en segundos después de observar un comando pendiente. |
+| `--poll-max-interval` | `1` | Máximo de la espera exponencial entre consultas de dependencias. |
+| `--drain-timeout` | `30` | Segundos adicionales para terminar comandos pendientes tras finalizar k6. |
+| `--publish-concurrency` | `64` | Máximo de publicaciones pendientes de confirmación por proceso de API. |
+| `--worker-concurrency` | `8` | Comandos simultáneos del worker y prefetch; se guarda en el manifiesto y en cada configuración. |
 | `--no-build` | Desactivado | Reutiliza la imagen de la API ya construida. |
 
-Un usuario virtual ejecuta una operación cada vez. k6 utiliza tantos como necesita
+Un usuario virtual ejecuta un flujo cada vez. k6 utiliza tantos como necesita
 para mantener el ritmo solicitado, hasta el límite indicado. Si las respuestas
 tardan más, hacen falta más usuarios concurrentes para mantener ese ritmo.
+A 400 flujos/s, 200 usuarios solo bastan si cada flujo ocupa, en promedio, como
+máximo 0,5 segundos. El polling también mantiene ocupado al usuario virtual.
+Comprueba los descartes y la CPU de k6 antes de atribuir una limitación al servidor.
 
 ## Qué se prueba
 
-| Escenario | Operación | Qué permite comparar |
-|---|---|---|
-| `read` | Consultar una entrega existente. | Lecturas y coste de obtener conexiones. |
-| `create` | Crear una entrega pendiente. | Escrituras sobre entidades independientes. |
-| `flow` | Crear, entregar, solicitar devolución y consultar el resultado. | El recorrido completo por HTTP, casos de uso y persistencia. |
+El único recorrido medido es crear una entrega, marcarla como entregada y
+solicitar su devolución. Cada flujo utiliza entidades nuevas y sus resultados se
+contrastan después con las filas persistidas y sus relaciones.
 
-Los ritmos representan operaciones completas por segundo. `read` y `create`
-necesitan una petición por operación; `flow` necesita cuatro. Comparar 50 flujos
-por segundo con 50 lecturas por segundo no equivale a enviar la misma carga HTTP.
+| Variante | Solicitudes durante un flujo sin esperas adicionales |
+|---|---|
+| `postgres_pool` | Tres POST: crear entrega, entregar y solicitar devolución. No hay GET de verificación. |
+| `event_driven` | Tres POST de comandos y dos GET de estado como mínimo, para obtener la entrega creada y confirmar que se ha entregado antes de solicitar la devolución. |
 
-Antes de generar carga se comprueba, una vez por adaptador, el contrato actual
-de la aplicación:
+La primera consulta de cada dependencia es inmediata. Si sigue pendiente, se
+esperan 100 ms, 200 ms, 400 ms, 800 ms y después hasta 1 s entre consultas, con los
+valores predeterminados. La espera y el timeout de cada petición se acotan al
+plazo de `--command-timeout`. No se consulta el tercer comando ni se hace un GET
+de la devolución durante la carga: se verifican al terminar. Así se reduce la
+interferencia de observación, aunque las dos dependencias todavía añaden
+consultas HTTP/SQL y espera real al flujo.
 
-- Al intentar entregar simultáneamente la misma entrega pendiente, una petición
-  debe responder `200` y las demás `409`. Solo hay una transición de estado.
-- Repetir la solicitud de devolución puede crear varias devoluciones para la
-  misma entrega. Actualmente no hay idempotencia ni una restricción de devolución
-  única. El evaluador comprueba ese comportamiento; no lo presenta como una
-  garantía contra duplicados.
-- Solicitar una devolución para una entrega pendiente o inexistente debe fallar
-  con `409` o `404`, respectivamente, sin guardar una devolución.
+Una respuesta `202` solo confirma aceptación. En `summary.json`,
+`workflows_submitted` indica que la última operación recibió la respuesta
+esperada; en eventos, `workflows_completed` permanece a cero porque k6 no observa
+la finalización del último comando. Los completados y sus percentiles finales se
+calculan en la auditoría y aparecen en `verification.json`, `result.json`, el CSV
+y el informe. Las latencias de los POST asíncronos siguen disponibles como
+medidas de aceptación, separadas del resultado E2E.
+
+Antes de generar carga se comprueba, una vez por variante, el mismo contrato:
+
+- Repetir concurrentemente la misma clave crea una sola entrega o devolución y
+  conserva su resultado, también al reintentar después de completarse.
+- Entregar una entrega ya entregada devuelve el mismo estado, incluso con otra
+  clave: ambas rutas ejecutan `ensure_delivery_delivered`.
+- Claves distintas de devolución crean devoluciones distintas para la misma
+  entrega; la idempotencia no impone una devolución única por entrega.
+- Reutilizar una clave con otro contenido u operación devuelve `409`.
+- Solicitar una devolución para una entrega pendiente o inexistente no crea una
+  devolución: el comando guarda `failed` y repetir la clave conserva ese fallo.
+  La directa responde `409` o `404`; en eventos el fallo se consulta después de
+  recibir `202`.
+
+El preflight consulta los resultados y las filas persistidas en ambas variantes,
+fuera de la carga medida, y guarda el resultado en `reliability-*.json`. Durante
+la carga, los tres POST de ambas variantes llevan `Idempotency-Key: <UUID>`;
+la directa sigue realizando únicamente tres POST, sin consultas adicionales.
+
 
 ## Metodología
 
@@ -154,26 +248,46 @@ escritos durante el calentamiento no cambien el punto de partida. Se alterna el
 orden de los adaptadores entre repeticiones para reducir el efecto de ejecutarlos
 siempre en el mismo orden.
 
+En eventos, una vez que k6 termina, se detiene primero la API de forma ordenada
+para que ninguna solicitud todavía en curso registre o publique comandos después
+de comprobar el trabajo pendiente. El worker continúa ejecutándose. Un auxiliar
+consulta el número total de comandos pendientes en PostgreSQL una vez por segundo,
+con una última comprobación al agotar el plazo, durante un máximo de 30 segundos
+por defecto (`--drain-timeout`). Esta espera adicional solo ocurre después de la
+carga, no hace polling HTTP por comando y queda registrada en `command-drain.json`.
+Después se detiene el worker, se comprueba el cierre de conexiones y se auditan
+los datos y las colas. Agotar el plazo hace fallar la fase aunque algún comando
+alcance a terminar durante el cierre posterior.
+
 El calentamiento se registra y audita por separado. Incumplir sus umbrales no
 impide medir: precisamente queremos observar los errores cuando una configuración
 se satura. Antes de restaurar los datos se comprueba que puede hacerse sin que
 queden operaciones anteriores pendientes:
 
-- Si todos los flujos iniciados terminan con respuestas válidas, se conserva el
+- En la variante directa, si todos los flujos iniciados terminan con respuestas válidas, se conserva el
   proceso de la API y su pool caliente. Esto también se aplica cuando k6 haya
   descartado operaciones que no llegó a iniciar.
-- Si hay errores, flujos incompletos o escrituras de resultado desconocido, se
+- En la variante directa, si hay errores, flujos incompletos o escrituras de resultado desconocido, se
   detiene la API y se espera a que desaparezcan sus conexiones a PostgreSQL.
   Entonces se audita el calentamiento, se reinicia la API y se preparan los datos
   de la medición. Se registra `warmup_recovery: "api_restarted"`: esta medición
   puede empezar con el proceso y el pool fríos, lo que hay que considerar al
   interpretar sus latencias.
+- En eventos siempre se detienen **API y worker**, se espera el cierre de sus
+  conexiones y se auditan comandos, datos y colas. Antes de preparar la siguiente
+  fase se purgan la cola y su DLQ, y se vacían también los registros de comandos.
+  Los datos y el trabajo pendiente del calentamiento quedan en sus artefactos
+  antes del reset. Se registra `warmup_recovery: "api_and_worker_restarted"`:
+  los procesos y pools de eventos se reinician antes de la medición, incluso si
+  el calentamiento fue correcto. Esta diferencia limita la comparación de
+  latencias de arranque con las variantes que conservan el pool caliente.
 
-Si la medición termina con errores o resultados incompletos, también se detiene
-la API y se espera a que desaparezcan sus conexiones antes de auditar los datos.
-Ese cierre queda fuera de las latencias y del tiempo usado para calcular el
-rendimiento. Si no se puede confirmar que han terminado las operaciones en la
-base de datos, se aborta el experimento en lugar de reinicializarla.
+En la variante directa, si la medición termina con errores o resultados
+incompletos, también se detiene la API y se espera a que desaparezcan sus
+conexiones antes de auditar los datos. En eventos se aplica siempre la secuencia
+de cierre, espera acotada y auditoría descrita arriba. Si no se puede confirmar
+que han terminado las operaciones en la base de datos, se aborta el experimento
+en lugar de reinicializarla.
 
 k6 intenta iniciar operaciones a un ritmo fijo. Así, cuando la API se ralentiza,
 el cliente no reduce automáticamente la carga por esperar las respuestas. Si no
@@ -182,30 +296,81 @@ ejecución con descartes no demuestra que la API haya sostenido el ritmo solicit
 
 Se conservan por ejecución:
 
-- Operaciones terminadas correctamente por segundo (*goodput*) y peticiones HTTP
-  iniciadas por el cliente. Un flujo solo cuenta como correcto si supera todas
-  sus comprobaciones.
-  El tiempo utilizado para calcular el goodput incluye la espera final para que
-  terminen las operaciones que ya estaban en curso.
-- Latencias p50, p95 y p99 por endpoint y de los flujos completados correctamente.
-  Por ejemplo, p95 es el tiempo dentro del cual termina el 95 % de las operaciones
-  medidas. Las latencias de los flujos correctos deben leerse junto a los errores;
-  excluyen los flujos fallidos.
+- Flujos completos verificados por segundo (*goodput*) y latencias E2E p50, p95
+  y p99, calculados después de la carga. Solo los flujos terminados con datos y
+  relaciones correctos aportan una muestra de latencia.
+- Latencias por endpoint y recuentos HTTP como diagnóstico; no sustituyen las
+  métricas de flujo completo.
 - Peticiones HTTP correctas y fallidas, con recuentos y porcentajes, y el desglose
   de fallos por respuestas `4xx`, `5xx`, errores de transporte y respuestas
-  inesperadas. Los timeouts se muestran como parte de los errores de transporte.
-- Flujos iniciados, completados e incompletos, e iteraciones descartadas antes de
-  llegar a la API. Los resultados del calentamiento aparecen por separado.
-- Muestras de CPU y memoria de los contenedores de API, PostgreSQL y k6 mediante
-  `docker stats`: el muestreo espera al arranque de k6 y deja dos segundos entre
-  consultas; cada consulta también necesita tiempo.
-- Resultado de verificar los datos persistidos contra los identificadores
-  confirmados por la API.
+  inesperadas. Los timeouts son parte de los errores de transporte.
+- Flujos iniciados, completados, fallidos, pendientes, con comandos ausentes o
+  incompletos; e iteraciones descartadas antes de iniciarse. Los resultados del
+  calentamiento aparecen por separado.
+- Muestras de CPU y memoria de API, PostgreSQL y k6, además de worker y RabbitMQ
+  en eventos, mediante `docker stats`. El muestreo espera al arranque de k6 y deja
+  dos segundos entre consultas; cada consulta también necesita tiempo. Solo
+  toma muestras mientras existe el contenedor de k6; no mide el drenaje posterior.
+- Comprobación de entidades, estados y relaciones contra los recibos de flujo y
+  los resultados persistidos de los tres comandos en ambas variantes.
+- En ambas: comandos intentados, aceptados, completados, fallidos, pendientes o
+  ausentes. Solo en eventos: timeouts de observación de dependencias y mensajes
+  restantes en la cola de trabajo y en la DLQ. Las colas se inspeccionan con API y worker detenidos,
+  después de auditar la fase y antes de purgar.
 
-Las escrituras confirmadas se anotan en un registro de recibos para poder
-comprobarlas después. Esa instrumentación añade trabajo al generador y debe
-mantenerse igual en todas las variantes. La verificación de la base de datos se
-realiza después de la carga y queda fuera de las latencias HTTP.
+Cada intento de flujo escribe un recibo con `flow_id`, `started_at_ms` y
+`finished_at_ms`, incluso si falla la primera petición. Incluye los identificadores
+de las entidades confirmadas y todos los `command_id` intentados y los
+que recibieron aceptación. Un error o timeout del POST no elimina ese identificador:
+la auditoría puede localizar su resultado después. Antes del POST de devolución
+también se registra `return_attempted`, para poder atribuir el resultado directo
+si se pierde esa respuesta. Los recibos añaden trabajo al generador, pero no
+consultas al sistema medido.
+
+La latencia E2E utiliza el mismo límite en las dos variantes: empieza en el
+cliente justo antes de la primera solicitud y termina con el **commit de la
+transacción que crea la devolución**. La auditoría obtiene ese instante mediante
+`pg_xact_commit_timestamp(returns.xmin)` y exige que la entrega y la devolución
+coincidan con el flujo. En ambas exige además los tres comandos completados y
+sus resultados correctos. La latencia principal no incluye esperar a observar el
+resultado final ni la respuesta HTTP posterior al commit. La latencia hasta la
+respuesta directa de k6 queda disponible como diagnóstico en `summary.json`.
+
+Solo el PostgreSQL del entorno de benchmark activa `track_commit_timestamp=on`,
+en **todas las variantes**. Esta instrumentación añade trabajo a PostgreSQL y se
+mantiene igual en la comparación; no es necesaria para la idempotencia ni se
+habilita en la configuración de desarrollo o producción. Las marcas de commit
+se consultan inmediatamente después de cada fase y se guardan en los artefactos:
+PostgreSQL no las conserva indefinidamente, por lo que no deben tratarse como un
+registro de auditoría permanente. Si falta una marca necesaria (`NULL`), la
+medición falla en lugar de sustituirla por la hora de observación. Véase la
+[documentación de timestamps de commit de PostgreSQL](https://www.postgresql.org/docs/17/functions-info.html#FUNCTIONS-COMMIT-TIMESTAMP).
+
+Los comandos guardan `created_at` al registrarse por primera vez y `completed_at`
+cuando terminan, también si fallan. Ambos utilizan el reloj de PostgreSQL;
+`completed_at` se toma justo antes del commit y sirve como dato de diagnóstico
+del comando, no como final principal del flujo. El resultado terminal y su
+timestamp se confirman en la misma transacción que las escrituras de negocio. Los reintentos conservan los timestamps originales. Los
+registros anteriores a esta instrumentación mantienen tiempos desconocidos
+(`NULL`), sin inventar su historia. La auditoría conserva los timestamps y la
+duración de cada comando junto al resultado de su flujo. Estas duraciones no
+sustituyen la E2E: no incluyen, por ejemplo, el tiempo anterior al primer registro
+ni las esperas entre comandos.
+
+Para calcular E2E se combinan el inicio del cliente y el final de PostgreSQL: los
+contenedores de este experimento comparten el reloj del host Docker. Trasladar el
+generador o la base de datos a otra máquina exigiría sincronizar y comprobar sus
+relojes. El límite de finalización en PostgreSQL es común a las dos variantes;
+la entrega del resultado al cliente final queda fuera de esa latencia de negocio.
+
+El goodput divide los flujos completos auditados entre el tiempo desde el inicio
+de la carga hasta el mayor de estos límites: final del intervalo de carga
+ofrecida, final del último intento registrado por k6 o última finalización
+persistida de los flujos y comandos observada en la auditoría. Así incluye el trabajo que termina
+posteriormente, sin añadir al denominador el tiempo administrativo de analizar
+archivos o inspeccionar colas. La espera hasta la siguiente consulta del auxiliar
+no alarga artificialmente la latencia del comando: se usa su timestamp persistido.
+Los percentiles excluyen flujos sin completar y deben leerse junto a esos recuentos.
 
 Se muestran los percentiles de cada repetición por separado: no se promedian
 percentiles para obtener uno supuestamente global. Para decidir qué variante
@@ -220,13 +385,28 @@ El evaluador distingue tres niveles que tienen denominadores diferentes:
 | Medida | Cálculo | Qué significa |
 |---|---|---|
 | Peticiones HTTP fallidas | Fallidas clasificadas / total de peticiones iniciadas por el cliente. | Una petición no cumplió el estado HTTP y el cuerpo esperados. |
-| Flujos incompletos | (Iniciados − completados) / iniciados. | Un flujo comenzó, pero no terminó todos sus pasos correctamente. |
+| Flujos sin completar | (Iniciados − completados auditados) / iniciados. | No se pudo verificar el resultado final del flujo en esta observación. |
 | Operaciones descartadas | Descartadas / (iniciadas + descartadas). | k6 no tuvo capacidad para iniciar esas operaciones al ritmo solicitado; nunca llegaron a la API. |
 
-Un flujo correcto de `flow` realiza cuatro peticiones HTTP. Si falla un paso,
-el flujo se detiene y no envía los siguientes: con errores, multiplicar los flujos
-iniciados por cuatro no da el número de peticiones HTTP iniciadas. Las operaciones
-descartadas tampoco son peticiones HTTP rechazadas por el servidor.
+Un flujo directo correcto realiza tres peticiones HTTP; en eventos realiza tres
+POST y al menos dos GET de dependencias. Si falla un paso, el flujo se detiene y
+no envía los siguientes: con errores, multiplicar los flujos iniciados por tres
+no da el número de peticiones HTTP iniciadas. Las operaciones descartadas tampoco
+son peticiones HTTP rechazadas por el servidor.
+
+La auditoría reparte los flujos sin completar en categorías excluyentes:
+
+| Estado | Qué se observó al auditar |
+|---|---|
+| `failed` | Un comando falló o los datos del flujo incumplen las comprobaciones. |
+| `missing` | Falta al menos un comando que el cliente intentó enviar, sin un fallo terminal que tenga precedencia. |
+| `pending` | Hay comandos registrados que siguen pendientes, sin comandos fallidos o ausentes. |
+| `incomplete` | No se enviaron todos los pasos, o falta confirmación suficiente para reconstruir el resultado directo. |
+
+`pending`, `missing` e `incomplete` describen lo que no pudo resolverse dentro del
+experimento; **no prueban una pérdida permanente de mensajes**. Un comando
+intentado ausente puede corresponder a una petición que nunca llegó a registrarse,
+y un pendiente puede requerir más tiempo o una reentrega.
 
 En `summary.json`, los contadores HTTP propios del evaluador son:
 
@@ -257,12 +437,21 @@ En el CSV, `http_error_percent` usa las peticiones iniciadas como denominador;
 `failed_workflows` y `workflow_error_percent` describen los flujos incompletos.
 
 **Fallo HTTP no equivale a pérdida de datos.** Una escritura puede guardarse y
-su respuesta no llegar al cliente. `unknown_writes` identifica de forma
-conservadora escrituras cuyo resultado no se puede confirmar desde la respuesta.
-La auditoría SQL comprueba los identificadores de las escrituras confirmadas,
-también los de pasos correctos de un flujo que falló más tarde. Cuando hay
-escrituras desconocidas, no se puede afirmar que no hubo pérdida o duplicación
-solo contando las filas finales.
+su respuesta no llegar al cliente. `unknown_writes` conserva las escrituras cuyo
+resultado no se pudo confirmar en la respuesta. Si la auditoría encuentra el
+flujo completo y sus datos de negocio correctos, cuenta como completado aunque
+el POST final haya respondido con error o haya agotado su timeout. En ambas
+variantes exige los tres comandos completados, con resultados y filas de
+negocio consistentes. Su latencia se calcula con el commit persistido. Los
+contadores HTTP y la incertidumbre observada por el cliente no se borran y **la
+ejecución sigue fallando sus comprobaciones de carga**. Completar el trabajo más
+tarde no convierte una experiencia HTTP fallida en satisfactoria.
+
+La auditoría también puede atribuir una creación directa cuya respuesta se perdió
+mediante su `command_id`. Eso no completa el flujo si el cliente no pudo obtener
+la entrega para continuar: se conserva como incompleto, con el comando y la fila
+correspondientes. Contar filas sin relacionarlas con los comandos no basta para
+demostrar ausencia de pérdidas o duplicados.
 
 ## Resultados
 
@@ -278,13 +467,15 @@ orchestrator.log        Comandos ejecutados y su salida
     configuration.json Configuración de esta medición
     summary.json       Mediciones y comprobaciones de k6
     result.json        Métricas normalizadas y estado de esta fase
-    receipts.log       Identificadores confirmados para la auditoría
-    verification.json
+    receipts.log       Un recibo por flujo, con tiempos e IDs intentados/confirmados
+    verification.json  Flujos, comandos, datos y latencias reconciliados
     resources.jsonl    Muestras de recursos de los contenedores
     resource-coverage.json  Número de muestras por servicio y avisos
     k6.log             Salida del generador
     services.log       Logs recientes de API y PostgreSQL
-    drain.json         Comprobación de conexiones, si fue necesario detener la API
+    drain.json         Comprobación de cierre de conexiones antes de auditar
+    command-drain.json Espera acotada del trabajo pendiente, solo en eventos
+    queues.json        Mensajes y consumidores de ambas colas, solo en eventos
     warmup/            Los mismos artefactos de fase, para el calentamiento
 ```
 
@@ -300,29 +491,37 @@ o no poder asegurar que no quedan operaciones en PostgreSQL detiene el
 experimento. Se conservan resultados y logs; si no llega a generarse una tabla,
 consulta `manifest.json` y `orchestrator.log`.
 
-El informe contiene tres tablas: mediciones, desglose de sus fallos HTTP y
-calentamientos con sus propios fallos, auditorías y recuperación. En el CSV,
+El informe muestra mediciones, comandos y colas, consumo de CPU, desglose de
+fallos HTTP y calentamientos con sus propias auditorías y recuperación. En el CSV,
 los campos `warmup_*` resumen el calentamiento y `warmup_recovery` indica si hubo
 que reiniciar la API. Un calentamiento fallido no se confunde con una medición
 omitida ni sus contadores se suman a los de los segundos de carga medidos.
 
 El manifiesto, cada `configuration.json` y el CSV incluyen `execution_model: "async"`.
-El informe también identifica ese modelo. Los artefactos de experimentos anteriores
+Cada ejecución identifica además `processing_model` (`direct` o `queued`), el
+adaptador de persistencia y los límites de CPU y procesos asignados. El informe
+también identifica ese modelo. Los artefactos de experimentos anteriores
 no se modifican: `postgres` y `postgres_pool` representaban implementaciones
 síncronas en versiones anteriores del código. Para interpretarlos, consulta su
 commit, las huellas del código y la configuración guardada; la ausencia de esta
 nueva etiqueta no permite deducir por sí sola cómo se ejecutó una medición.
-El manifiesto añade `result_format_version: 2` para identificar este formato de
-resultados; los artefactos de ejecuciones anteriores se conservan intactos.
+El manifiesto añade `result_format_version: 5` y `summary.json` incluye
+`benchmark.version: 5`, el inicio y la duración de la carga ofrecida. El formato
+v5 añade idempotencia y auditoría de comandos a la ejecución directa. **Los
+resultados anteriores no son comparables directamente**: v4 medía la directa sin
+registro idempotente, y v3 además consultaba el final por HTTP. Los artefactos
+anteriores se conservan intactos; no se presentan como mediciones de este cambio.
+La auditoría mantiene compatibilidad con los recibos v4 históricos.
 
 `resource_warnings` en el CSV indica avisos de muestreo; su detalle está en
 `resource-coverage.json`. La ausencia de muestras no significa consumo cero ni
 invalida automáticamente las comprobaciones HTTP y de datos.
 
 La validación de carga exige que todas las comprobaciones de respuesta pasen,
-que se complete al menos una operación y que no haya errores técnicos,
-escrituras de resultado desconocido ni iteraciones descartadas. Todavía no se
-impone un límite de latencia: que una ejecución pase estas comprobaciones no
+que se envíe al menos un flujo hasta el último paso y que no haya errores técnicos,
+escrituras de resultado desconocido ni iteraciones descartadas. La auditoría
+posterior exige flujos completos y correctos; agotar la espera de comandos
+pendientes también hace fallar la fase. Todavía no se impone un límite de latencia: que una ejecución pase estas comprobaciones no
 significa que cumpla un objetivo de tiempo de respuesta del producto.
 
 Para probar el propio evaluador sin generar carga, si `api/.venv` tiene las
@@ -359,23 +558,32 @@ tampoco recoge todavía las estadísticas internas del pool ni las esperas dentr
 de PostgreSQL. Las pruebas cortas de conflictos y repetición comprueban casos
 concretos; no demuestran corrección bajo todas las carreras posibles.
 
-Un timeout puede ocurrir después de que PostgreSQL confirme una escritura. Si el
-cliente no recibió su identificador, el resultado es desconocido: no podemos
-dar por válido ese caso de fiabilidad solo con el recibo de las respuestas. Para
-estudiar reintentos y efectos duplicados bajo esos fallos necesitaremos un
-identificador de operación y un contrato de idempotencia. El generador actual
-no reintenta automáticamente las peticiones fallidas.
+Un timeout puede ocurrir después de que PostgreSQL confirme una escritura. El
+generador no reintenta automáticamente las peticiones fallidas. Los identificadores
+de comandos y los intentos de devolución permiten recuperar resultados bajo las
+condiciones descritas arriba. Una finalización tardía puede aumentar los flujos
+completos auditados, pero mantiene el error HTTP y el fallo de la ejecución.
 
-Quedan para siguientes experimentos los cortes de conexión a PostgreSQL, la
-recuperación tras fallos, cargas sostenidas más largas y la comparación con
-ORM o eventos. Para eventos habrá que distinguir la aceptación duradera de una
-solicitud y la finalización de su operación: medir ambas latencias, operaciones
-completadas por segundo, trabajo pendiente, reentregas y efectos de duplicados.
-Una cola puede absorber picos y permitir reintentos, pero su mera presencia no
-garantiza que no haya pérdidas. Habrá que evaluar las confirmaciones, la
-durabilidad y la idempotencia, y seguir las solicitudes aceptadas para distinguir
-las completadas, las pendientes y las que no se pudieron recuperar. Acabar la
-generación de carga no significa que se haya vaciado la cola.
+La cola se inspecciona al terminar cada fase, tras detener los procesos; no se
+mide continuamente su máximo tamaño ni se cuenta cada reentrega. Los comandos
+pendientes no se dejan ejecutar indefinidamente: la espera posterior tiene un
+límite, se conserva su resultado y el trabajo restante se elimina durante el
+reset aislado. Acabar la generación de carga no significa que se haya vaciado
+la cola. Las latencias usan los timestamps de finalización y el goodput incluye
+el intervalo de carga y el trabajo observado que termina después; no se calculan
+solo sobre las respuestas `202` ni sobre los comandos que el cliente alcanzó a
+consultar.
+
+Persisten dos consultas mínimas de dependencias por flujo asíncrono, y más si el
+worker todavía no ha terminado. Eliminarlas requeriría cambiar cómo se encadenan
+las operaciones o se comunican sus resultados. Este evaluador reduce la
+observación innecesaria y hace explícito el coste que todavía tiene el protocolo.
+
+Quedan para siguientes experimentos los cortes de conexión, la recuperación tras
+fallos, cargas sostenidas más largas, varios consumidores y la comparación con
+ORM. Una cola puede absorber picos y permitir reintentos, pero estas mediciones
+por sí solas no demuestran recuperación ante todos los fallos ni ausencia de
+pérdidas bajo cualquier condición.
 
 Para profundizar, la documentación de k6 explica el
 [modelo abierto de carga](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/)

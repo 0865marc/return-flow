@@ -56,8 +56,11 @@ class ResourceSampler:
                 self.stop_event.wait(2)
 
 
-def sample_coverage(path: Path) -> dict:
+def sample_coverage(path: Path, *, include_messaging: bool = False) -> dict:
     coverage = {"api": 0, "postgres": 0, "k6": 0}
+    if include_messaging:
+        coverage.update(worker=0, rabbitmq=0)
+    cpu = {service: [] for service in coverage}
     warnings = []
     if path.exists():
         for line in path.read_text().splitlines():
@@ -66,10 +69,18 @@ def sample_coverage(path: Path) -> dict:
                 warnings.append(sample["warning"])
             for container in sample.get("containers", []):
                 name = container.get("Name", "")
-                for service, suffix in (("api", "-api-1"), ("postgres", "-postgres-1"), ("k6", "-load")):
+                for service in coverage:
+                    suffix = "-load" if service == "k6" else f"-{service}-1"
                     if name.endswith(suffix):
                         coverage[service] += 1
+                        try:
+                            cpu[service].append(float(container["CPUPerc"].rstrip("%")))
+                        except (KeyError, ValueError, TypeError):
+                            warnings.append(f"Invalid CPU sample for {service}.")
     for service, count in coverage.items():
         if not count:
             warnings.append(f"No resource samples for {service}.")
-    return {"samples_by_service": coverage, "warnings": warnings}
+    return {"samples_by_service": coverage, "warnings": warnings,
+            "cpu_percent": {service: {"mean": sum(values) / len(values) if values else None,
+                                      "max": max(values) if values else None}
+                            for service, values in cpu.items()}}
