@@ -3,6 +3,7 @@ import logging
 import signal
 
 from aio_pika import connect_robust
+from aio_pika.abc import AbstractIncomingMessage
 
 from adapters.messaging.consumer import CommandConsumer
 from adapters.messaging.settings import MessagingSettings
@@ -27,13 +28,31 @@ async def run_worker(
         )
         async with connection:
             channel = await connection.channel()
-            await channel.set_qos(prefetch_count=1)
+            await channel.set_qos(prefetch_count=settings.worker_concurrency)
             queue = await declare_topology(channel, settings.queue_name)
             consumer = CommandConsumer(repositories.commands)
-            logger.info("Command worker consuming queue=%s", settings.queue_name)
-            async with queue.iterator() as messages:
-                async for message in messages:
+            slots = asyncio.Semaphore(settings.worker_concurrency)
+
+            async def handle(message: AbstractIncomingMessage) -> None:
+                try:
                     await consumer.handle(message)
+                finally:
+                    slots.release()
+
+            logger.info(
+                "Command worker consuming queue=%s concurrency=%s",
+                settings.queue_name,
+                settings.worker_concurrency,
+            )
+            async with queue.iterator() as messages:
+                # Cancel and await handlers before closing their messaging and
+                # database resources. A handler failure stops its siblings too;
+                # unacknowledged messages remain available for redelivery.
+                async with asyncio.TaskGroup() as tasks:
+                    async for message in messages:
+                        # Acquire before spawning to bound tasks as well as work.
+                        await slots.acquire()
+                        tasks.create_task(handle(message))
 
 
 async def main() -> None:

@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import worker
+from adapters.commands.contracts import CreateDeliveryCommand
+from adapters.messaging.consumer import CommandConsumer
 from adapters.messaging.settings import MessagingSettings
 
 pytestmark = pytest.mark.anyio
@@ -92,7 +94,7 @@ async def test_worker_wires_resources_and_closes_them_in_reverse_order(worker_re
         "postgresql://localhost/test", factory=resources.factory
     )
     resources.connect.assert_awaited_once_with(settings.url, timeout=3)
-    resources.channel.set_qos.assert_awaited_once_with(prefetch_count=1)
+    resources.channel.set_qos.assert_awaited_once_with(prefetch_count=8)
     resources.topology.assert_awaited_once_with(resources.channel, "test.commands")
     resources.make_consumer.assert_called_once_with(resources.repository)
     assert [
@@ -108,7 +110,7 @@ async def test_worker_wires_resources_and_closes_them_in_reverse_order(worker_re
     ]
 
 
-@pytest.mark.parametrize("failure_stage", ["connect", "channel", "topology", "handle"])
+@pytest.mark.parametrize("failure_stage", ["connect", "channel", "topology"])
 async def test_worker_closes_acquired_resources_when_startup_or_processing_fails(
     worker_resources, failure_stage
 ):
@@ -117,7 +119,6 @@ async def test_worker_closes_acquired_resources_when_startup_or_processing_fails
         "connect": resources.connect,
         "channel": resources.connection.channel,
         "topology": resources.topology,
-        "handle": resources.handler,
     }[failure_stage]
     failing_call.side_effect = ConnectionError("Connection lost")
 
@@ -127,31 +128,127 @@ async def test_worker_closes_acquired_resources_when_startup_or_processing_fails
     assert resources.events[-1] == "persistence closed"
     if failure_stage != "connect":
         assert resources.events[-2] == "connection closed"
-    if failure_stage == "handle":
-        assert resources.events[-3] == "iterator closed"
 
 
-async def test_worker_cancellation_unwinds_in_flight_processing_and_resources(
-    worker_resources,
-):
+@pytest.mark.parametrize("concurrency", [1, 3, 8])
+async def test_worker_overlaps_processing_and_bounds_tasks(worker_resources, concurrency):
     resources = worker_resources
-    processing_started = asyncio.Event()
+    resources.messages[:] = [object() for _ in range(concurrency * 3)]
+    capacity_reached = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    maximum_active = 0
+    finished = []
 
     async def handle(message):
-        processing_started.set()
-        await asyncio.Future()
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(active, maximum_active)
+        if active == concurrency:
+            capacity_reached.set()
+        try:
+            await release.wait()
+            finished.append(message)
+        finally:
+            active -= 1
 
     resources.handler.side_effect = handle
+    existing_tasks = asyncio.all_tasks()
     task = asyncio.create_task(
-        worker.run_worker(MessagingSettings(url="amqp://localhost"))
+        worker.run_worker(
+            MessagingSettings(url="amqp://localhost", worker_concurrency=concurrency)
+        )
     )
-    await asyncio.wait_for(processing_started.wait(), timeout=1)
-    task.cancel()
+    try:
+        await asyncio.wait_for(capacity_reached.wait(), timeout=1)
+        assert resources.handler.await_count == concurrency
+        # A waiting task must not be created for every queued message.
+        assert len(asyncio.all_tasks() - existing_tasks) == concurrency + 1
+        resources.channel.set_qos.assert_awaited_once_with(prefetch_count=concurrency)
+        assert resources.events[-1] == "iterator opened"
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    assert maximum_active == concurrency
+    assert set(finished) == set(resources.messages)
+    assert active == 0
+    assert resources.events[-3:] == [
+        "iterator closed",
+        "connection closed",
+        "persistence closed",
+    ]
 
-    assert resources.handler.await_count == 1
+
+@pytest.mark.parametrize("stop_reason", ["cancellation", "handler_failure"])
+async def test_worker_cancels_and_awaits_all_handlers_before_closing_resources(
+    worker_resources, stop_reason
+):
+    resources = worker_resources
+    commands = [CreateDeliveryCommand() for _ in range(3)]
+    resources.messages[:] = [
+        SimpleNamespace(
+            body=command.model_dump_json().encode(),
+            message_id=str(command.command_id),
+            ack=AsyncMock(),
+            reject=AsyncMock(),
+        )
+        for command in commands
+    ]
+    all_started = asyncio.Event()
+    trigger_failure = asyncio.Event()
+    started = []
+    stopped = []
+
+    async def execute(command, handler):
+        started.append(command.command_id)
+        if len(started) == len(commands):
+            all_started.set()
+        try:
+            if command == commands[0] and stop_reason == "handler_failure":
+                await trigger_failure.wait()
+                raise ConnectionError("Database connection lost")
+            await asyncio.Future()
+        finally:
+            # Simulate asynchronous transaction rollback while resources are open.
+            await asyncio.sleep(0)
+            assert resources.events[-1] == "iterator opened"
+            stopped.append(command.command_id)
+
+    store = SimpleNamespace(execute=AsyncMock(side_effect=execute))
+    resources.make_consumer.return_value = CommandConsumer(store)
+    task = asyncio.create_task(
+        worker.run_worker(
+            MessagingSettings(url="amqp://localhost", worker_concurrency=3)
+        )
+    )
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        for message in resources.messages:
+            message.ack.assert_not_awaited()
+            message.reject.assert_not_awaited()
+        if stop_reason == "cancellation":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+        else:
+            trigger_failure.set()
+            with pytest.raises(ExceptionGroup) as raised:
+                await asyncio.wait_for(task, timeout=1)
+            assert len(raised.value.exceptions) == 1
+            error = raised.value.exceptions[0]
+            assert isinstance(error, ConnectionError)
+            assert str(error) == "Database connection lost"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert set(started) == set(stopped) == {command.command_id for command in commands}
+    for message in resources.messages:
+        message.ack.assert_not_awaited()
+        message.reject.assert_not_awaited()
     assert resources.events[-3:] == [
         "iterator closed",
         "connection closed",
