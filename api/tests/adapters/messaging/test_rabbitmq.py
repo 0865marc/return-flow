@@ -232,8 +232,39 @@ async def test_unroutable_publish_is_not_reported_as_accepted(
         await publisher.publish(command)
 
 
+async def test_concurrent_publications_of_one_command_are_confirmed_individually(
+    rabbitmq, publisher
+) -> None:
+    settings, connection = rabbitmq
+    command = EnsureDeliveryDelivered(delivery_id=uuid4())
+    await asyncio.gather(*(publisher.publish(command) for _ in range(16)))
+
+    channel = await connection.channel()
+    queue = await channel.get_queue(settings.queue_name)
+    message_ids = set()
+    for _ in range(16):
+        message = await next_message(queue)
+        assert EnsureDeliveryDelivered.model_validate_json(message.body) == command
+        assert message.correlation_id == str(command.command_id)
+        message_ids.add(message.message_id)
+        await message.ack()
+    assert len(message_ids) == 16
+    assert await queue.get(fail=False, timeout=5) is None
 
 
+async def test_concurrent_unroutable_retries_are_all_reported_as_unconfirmed(
+    rabbitmq, publisher
+) -> None:
+    settings, connection = rabbitmq
+    command = EnsureDeliveryDelivered(delivery_id=uuid4())
+    await publisher.publish(command)
+    channel = await connection.channel()
+    await channel.queue_delete(settings.queue_name, timeout=5)
+
+    results = await asyncio.gather(
+        *(publisher.publish(command) for _ in range(16)), return_exceptions=True
+    )
+    assert all(isinstance(result, MessagingUnavailableError) for result in results)
 
 
 async def wait_for_command(client, command_id, task, *, status="completed"):

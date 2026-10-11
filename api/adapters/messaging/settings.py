@@ -9,6 +9,7 @@ class MessagingSettings:
     queue_name: str = "return_flow.deliveries.commands"
     connect_timeout: float = 5
     publish_timeout: float = 5
+    publish_concurrency: int = 64
 
     def __post_init__(self) -> None:
         if not self.url:
@@ -24,6 +25,11 @@ class MessagingSettings:
         ):
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a positive finite number.")
+        for name, value in (
+            ("RABBITMQ_PUBLISH_CONCURRENCY", self.publish_concurrency),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
 
     @classmethod
     def from_env(cls) -> "MessagingSettings":
@@ -35,4 +41,5 @@ class MessagingSettings:
             queue_name=os.environ.get("RABBITMQ_QUEUE", "return_flow.deliveries.commands"),
             connect_timeout=float(os.environ.get("RABBITMQ_CONNECT_TIMEOUT", "5")),
             publish_timeout=float(os.environ.get("RABBITMQ_PUBLISH_TIMEOUT", "5")),
+            publish_concurrency=int(os.environ.get("RABBITMQ_PUBLISH_CONCURRENCY", "64")),
         )

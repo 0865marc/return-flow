@@ -13,6 +13,7 @@ services:
       RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-return_flow.deliveries.commands}
       RABBITMQ_CONNECT_TIMEOUT: ${RABBITMQ_CONNECT_TIMEOUT:-5}
       RABBITMQ_PUBLISH_TIMEOUT: ${RABBITMQ_PUBLISH_TIMEOUT:-5}
+      RABBITMQ_PUBLISH_CONCURRENCY: ${RABBITMQ_PUBLISH_CONCURRENCY:-64}
     depends_on:
       postgres:
         condition: service_healthy
