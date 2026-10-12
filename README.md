@@ -568,61 +568,51 @@ son compartidos por el procesamiento directo y el worker.
 
 ## Evaluación de rendimiento y fiabilidad
 
-El evaluador de `benchmarks/` compara `postgres_pool` y `event_driven`.
-La primera completa el trabajo dentro de la petición HTTP; la segunda usa
-RabbitMQ y espera el resultado del worker. Ambas utilizan PostgreSQL con pool,
-código Python asíncrono, los mismos casos de uso y el mismo mecanismo de
-idempotencia. La versión sin pool se ha eliminado. Un script de Python arranca un
-entorno Docker aislado, ejecuta carga HTTP con k6, comprueba los datos persistidos
-y guarda los resultados en archivos locales. No requiere Grafana ni utiliza los
-datos de desarrollo.
+El nuevo evaluador de `benchmarks/` compara `postgres_pool` y `event_driven`
+con **ejecución y medición separadas**. Usa un entorno Docker aislado y no cambia
+el backend ni utiliza los datos de desarrollo.
 
-Para comprobar que funciona, desde la raíz del proyecto:
+1. **Preparación, fuera de los tiempos:** crea los datos necesarios, comprueba
+   disponibilidad y completa un comando de calentamiento.
+2. **Tiempo de ejecución:** envía solo POST a la tasa configurada, espera las
+   respuestas y deja un intervalo fijo para procesar trabajo pendiente. No hay
+   polling, consultas SQL de auditoría, healthchecks ni muestreo de recursos.
+   Después detiene API y worker para fijar el corte.
+3. **Tiempo de medición:** con los procesos de aplicación detenidos, lee un
+   snapshot de PostgreSQL y calcula las analíticas a partir de los recibos y
+   los comandos persistidos. Esta fase queda fuera del tiempo de ejecución.
+
+Se miden tres operaciones independientes: crear entregas, marcar entregadas
+entregas preparadas y solicitar devoluciones de entregas ya entregadas. Cada
+petición tiene su propia clave de idempotencia y sus propios datos. No se mide
+el flujo completo encadenado: la API asíncrona actual necesitaría consultar el
+resultado de un paso antes de enviar el siguiente.
+
+Prueba corta de los tres escenarios y las dos variantes:
 
 ```bash
 python3 benchmarks/run.py --smoke
 ```
 
-Para comparar las dos opciones con 2 CPU de aplicación:
+Una comparación con carga configurable:
 
 ```bash
-python3 benchmarks/run.py --adapters postgres_pool event_driven --app-cpus 2
+python3 benchmarks/run.py --operations return --rates 10 50 200 \
+  --duration 30 --drain-seconds 30 --repetitions 3 --app-cpus 2
 ```
 
-Por defecto, compara el flujo completo a 10, 50 y 400 flujos por segundo, con
-tres repeticiones por variante y carga: 18 mediciones en total. La variante
-directa asigna 2 CPU a la API con dos procesos; eventos reparte 1 CPU para la
-API y 1 CPU para el worker. PostgreSQL tiene 1 CPU en ambas variantes y
-RabbitMQ añade otra CPU en eventos, fuera del presupuesto de aplicación.
+Los informes separan latencia HTTP, tiempo interno persistido, errores HTTP,
+comandos completados/fallidos/pendientes/ausentes y peticiones que el generador
+no pudo enviar. Un `202` no cuenta como operación completada y un timeout puede
+corresponder a trabajo confirmado. Lo pendiente al corte no se considera perdido.
 
-La prueba corta valida el evaluador; no sirve para sacar conclusiones de
-rendimiento. Los resultados incluyen `execution_model: "async"` y distinguen
-`processing_model: "direct"` o `"queued"`; los
-resultados anteriores conservan su significado y no deben mezclarse solo porque
-coincidan los nombres de los adaptadores.
+Se usan los timestamps que ya guarda la aplicación; no se activa
+`track_commit_timestamp`. `completed_at - created_at` comienza al registrar el
+comando durante su ejecución y termina antes del commit: no incluye la espera
+previa en RabbitMQ ni es una latencia exacta de commit o de extremo a extremo.
+Se elimina la observación concurrente del benchmark, aunque generar
+carga y compartir máquina siguen consumiendo recursos.
 
-La medición continúa aunque el calentamiento incumpla los umbrales de carga,
-para observar también qué ocurre bajo saturación. El informe separa peticiones
-HTTP fallidas, flujos incompletos y operaciones que k6 no llegó a iniciar; además,
-audita las escrituras confirmadas en PostgreSQL. Una petición fallida no demuestra
-por sí sola que se haya perdido una escritura. En eventos, el `202` no cuenta
-como operación terminada. Se consultan solo los dos comandos necesarios para
-avanzar entre pasos, con esperas crecientes; la devolución final se verifica en
-PostgreSQL después de la carga. La variante directa ejecuta tres POST sin
-GET de comprobación. En eventos se permite al worker terminar el trabajo pendiente
-hasta un plazo configurable antes de detener los procesos y auditar.
-
-Cada intento tiene un recibo con identificador y tiempos. Solo en el PostgreSQL
-del benchmark se activa `track_commit_timestamp`, igual para las dos variantes:
-la latencia del flujo termina en el commit de la devolución. La auditoría reconstruye
-flujos completos, sus latencias y los comandos pendientes, fallidos o ausentes;
-no interpreta un timeout como pérdida definitiva. El formato de resultados es
-`5`: ambas variantes envían claves de idempotencia para las tres operaciones y
-persisten sus resultados como comandos. Los resultados históricos del formato
-`4` no son directamente comparables: el flujo directo no tenía ese trabajo de
-idempotencia. Las versiones anteriores también utilizaban otra metodología de
-polling. Es necesario ejecutar una medición nueva para comparar las dos
-implementaciones actuales.
-
-Consulta la [metodología y los comandos de evaluación](benchmarks/README.md)
-para configurar la carga, las repeticiones y leer sus resultados.
+Consulta la [metodología, las métricas y los comandos](benchmarks/README.md).
+Los resultados usan la metodología `two_phase_no_observation` y no deben
+mezclarse con los del benchmark anterior.

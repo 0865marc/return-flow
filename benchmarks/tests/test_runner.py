@@ -1,396 +1,311 @@
-import sys
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
+import io
 import json
-from contextlib import asynccontextmanager, nullcontext
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 from types import SimpleNamespace
-
-import pytest
-from fastapi import APIRouter, FastAPI
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import run as runner
-from run import Experiment, arguments, make_plan, requires_quiescence, result_row
-from resources import sample_coverage
+import unittest
+from unittest.mock import patch
 
 
-def summary(*, attempted=100, completed=100, dropped=0, unknown=0, errors=0, elapsed=12000):
-    return {
-        "state": {"testRunDurationMs": elapsed},
-        "metrics": {
-            "workflows_attempted": {"values": {"count": attempted}},
-            "workflows_completed": {"values": {"count": completed}},
-            "dropped_iterations": {"values": {"count": dropped}},
-            "unknown_writes": {"values": {"count": unknown}},
-            "technical_errors": {"values": {"count": errors}},
-            **{key: {"values": {"count": value}} for key, value in {
-                "http_requests_total": 4 * attempted,
-                "http_requests_succeeded": 4 * attempted - errors,
-                "http_requests_failed": errors,
-                "http_responses_4xx": 0,
-                "http_responses_5xx": errors,
-                "http_transport_errors": 0,
-                "http_timeouts": 0,
-                "http_unexpected_responses": 0,
-            }.items()},
-        },
-    }
+# The runner is also a standalone CLI, with sibling imports outside a package.
+with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
+    from benchmarks import driver, run
 
 
-def test_each_pair_has_the_same_load_and_alternates_execution_order():
-    plan = list(make_plan(arguments([
-        "--adapters", "postgres_pool", "event_driven",
-        "--repetitions", "2", "--rates", "10", "50",
-    ])))
-    assert [row["adapter"] for row in plan[:4]] == ["postgres_pool", "event_driven"] * 2
-    assert [row["adapter"] for row in plan[4:]] == ["event_driven", "postgres_pool"] * 2
-    for left, right in zip(plan[::2], plan[1::2]):
-        for key in ("scenario", "rate", "repetition", "application_cpus", "persistence_adapter", "idempotency"):
-            assert left[key] == right[key]
+class FakeCompose:
+    """Model process shutdown and artifact handoff without starting Docker."""
 
+    def __init__(self, project, env, *, stop_error=False, still_running=False,
+                 ps_error=False, execute_error=False):
+        self.project = project
+        self.env = env
+        self.output = Path(env["BENCH_OUTPUT"])
+        self.events = []
+        self.stopped = False
+        self.confirmed_stopped = False
+        self.stop_error = stop_error
+        self.still_running = still_running
+        self.ps_error = ps_error
+        self.execute_error = execute_error
 
-def test_smoke_covers_each_adapter_and_scenario_once():
-    plan = list(make_plan(arguments(["--smoke"])))
-    assert len(plan) == 2
-    assert all(run["execution_model"] == "async" for run in plan)
-    assert {(run["adapter"], run["scenario"]) for run in plan} == {
-        (adapter, scenario)
-        for adapter in ("postgres_pool", "event_driven")
-        for scenario in ("flow",)
-    }
-
-
-def test_throughput_includes_time_spent_draining_in_flight_work():
-    result = result_row({"execution_model": "async"}, summary(elapsed=20000), {"status": "passed"}, 0, 10)
-    assert result["status"] == "passed"
-    assert result["completed_per_s"] == 5
-    assert result["execution_model"] == "async"
-
-
-def test_event_variant_splits_the_same_application_cpu_and_memory_budget():
-    plan = list(make_plan(arguments(["--rates", "10", "--repetitions", "1", "--app-cpus", "2"])))
-    for run in plan:
-        assert run["api_cpus"] + run["worker_cpus"] == 2
-        assert run["api_memory_mib"] + run["worker_memory_mib"] == 1024
-        assert run["postgres_cpus"] == run["k6_cpus"] == 1
-    event = next(run for run in plan if run["adapter"] == "event_driven")
-    assert event["api_cpus"] == event["worker_cpus"] == 1
-    assert event["api_workers"] == event["worker_processes"] == 1
-    assert event["persistence_adapter"] == "postgres_pool"
-    assert event["rabbitmq_cpus"] == 1
-
-
-def test_worker_concurrency_is_recorded_and_passed_to_compose(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    experiment = Experiment(arguments(["--worker-concurrency", "3", "--repetitions", "1"]))
-    assert experiment.env["BENCH_WORKER_CONCURRENCY"] == "3"
-    for case in experiment.manifest["plan"]:
-        expected = 3 if case["adapter"] == "event_driven" else 0
-        assert case["worker_concurrency"] == case["worker_prefetch"] == expected
-        assert case["api_cpus"] + case["worker_cpus"] == 2
-
-
-def test_event_reset_purges_messages_and_resets_database_while_consumers_are_stopped(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    experiment = Experiment(arguments(["--adapters", "event_driven"]))
-    experiment.current_variant = "event_driven"
-    events = []
-    experiment.quiesce = lambda folder: events.append("quiesce")
-
-    def script(name, *args, **kwargs):
-        assert kwargs["standalone"] is True
-        events.append((name, args[0]))
-
-    experiment.api_script = script
-    experiment.start_api = lambda: events.append("start")
-    experiment.seed()
-    assert events == ["quiesce", ("messaging.py", "reset"), ("database.py", "seed"), "start"]
-
-
-def test_event_quiescence_stops_both_processes_before_waiting_for_database(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    experiment = Experiment(arguments(["--adapters", "event_driven"]))
-    experiment.current_variant = "event_driven"
-    commands = []
-    experiment.compose_command = lambda *args, **kwargs: commands.append(args)
-    experiment.api_script = lambda *args, **kwargs: commands.append(args)
-    experiment.quiesce(experiment.output / "phase")
-    assert commands[0][-2:] == ("api", "worker")
-    assert commands[1][:2] == ("database.py", "wait-idle")
-
-
-@pytest.mark.parametrize("async_http, async_repository", [(True, True), (False, True), (True, False)])
-def test_image_preflight_rejects_old_synchronous_routes_or_repositories(monkeypatch, async_http, async_repository):
-    async def asynchronous():
-        pass
-
-    def synchronous():
-        pass
-
-    @asynccontextmanager
-    async def lifespan(application):
-        application.state.delivery_repository = repository
-        application.state.return_repository = repository
-        yield
-
-    endpoint = asynchronous if async_http else synchronous
-    operation = asynchronous if async_repository else synchronous
-    repository = SimpleNamespace(add=operation, get=operation, save=operation)
-    router = APIRouter()
-    router.add_api_route("/deliveries", endpoint)
-    app = FastAPI(lifespan=lifespan)
-    app.include_router(router)
-    app.add_api_route("/health", asynchronous)
-    http_module = SimpleNamespace(router=router)
-    monkeypatch.setitem(sys.modules, "adapters", SimpleNamespace(http=http_module))
-    monkeypatch.setitem(sys.modules, "adapters.http", http_module)
-    monkeypatch.setitem(sys.modules, "main", SimpleNamespace(app=app))
-    experiment = Experiment.__new__(Experiment)
-    experiment.compose_command = lambda *args: exec(args[-1], {})
-
-    if async_http and async_repository:
-        experiment.verify_execution_model()
-    else:
-        with pytest.raises(RuntimeError, match="Rebuild without --no-build"):
-            experiment.verify_execution_model()
-
-
-@pytest.mark.parametrize("metrics", [
-    {}, summary(attempted=0, completed=0), summary(completed=99),
-    summary(dropped=1), summary(unknown=1), summary(elapsed=0),
-])
-def test_incomplete_or_untrustworthy_measurements_cannot_pass(metrics):
-    assert result_row({}, metrics, {"status": "passed"}, 0, 10)["status"] == "failed"
-
-
-@pytest.mark.parametrize("audit", ["failed", "inconclusive"])
-def test_successful_http_is_insufficient_when_database_audit_does_not_pass(audit):
-    assert result_row({}, summary(), {"status": audit}, 0, 10)["status"] == "failed"
-
-
-def test_k6_threshold_failure_is_preserved():
-    assert result_row({}, summary(), {"status": "passed"}, 99, 10)["status"] == "failed"
-
-
-def test_failed_http_percentage_uses_requests_not_workflows():
-    data = summary(attempted=10, completed=8, errors=2, unknown=2)
-    data["metrics"]["http_requests_total"]["values"]["count"] = 36
-    data["metrics"]["http_requests_succeeded"]["values"]["count"] = 34
-    data["metrics"]["http_responses_5xx"]["values"]["count"] = 1
-    data["metrics"]["http_transport_errors"]["values"]["count"] = 1
-    data["metrics"]["http_timeouts"]["values"]["count"] = 1
-    row = result_row({}, data, {"status": "inconclusive"}, 99, 10)
-    assert row["http_error_percent"] == pytest.approx(100 * 2 / 36)
-    assert row["failed_workflows"] == 2
-    assert row["workflow_error_percent"] == 20
-    assert row["http_requests_unfinished"] == 0
-    assert row["unknown_writes"] == 2
-    assert row["status"] == "failed"
-
-
-def test_interrupted_requests_are_not_reported_as_successful_or_classified_failures():
-    data = summary(completed=99)
-    data["metrics"]["http_requests_succeeded"]["values"]["count"] -= 1
-    row = result_row({}, data, {"status": "passed"}, 99, 10)
-    assert row["http_requests_unfinished"] == 1
-    assert row["http_requests_failed"] == 0
-    assert row["failed_workflows"] == 1
-    assert requires_quiescence(data)
-
-
-def test_skipped_measurements_have_no_fabricated_zero_counters():
-    row = result_row({}, None, {"status": "not_run"}, 1, 30)
-    assert row["status"] == "not_run"
-    for key in ("attempted", "completed", "completed_per_s", "failed_workflows",
-                "http_requests_total", "http_requests_failed", "http_error_percent",
-                "technical_errors", "unknown_writes", "dropped_iterations", "measured_seconds"):
-        assert row[key] is None
-
-
-def test_dropped_iterations_alone_do_not_require_restarting_a_quiescent_api():
-    assert not requires_quiescence(summary(dropped=5))
-    assert requires_quiescence(summary(completed=99, errors=1, unknown=1))
-    assert requires_quiescence({})
-
-
-@pytest.mark.parametrize("with_errors, drain_failure", [(False, False), (True, False), (True, True)])
-def test_failed_warmup_is_audited_and_followed_by_measurement(tmp_path, monkeypatch, with_errors, drain_failure):
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    monkeypatch.setattr(runner, "ResourceSampler", lambda *args: nullcontext())
-    experiment = Experiment(arguments(["--adapters", "postgres_pool", "--rates", "50", "--repetitions", "1"]))
-    events = []
-    warmup = summary(dropped=5, completed=99 if with_errors else 100,
-                     errors=int(with_errors), unknown=int(with_errors))
-
-    def compose(*args, **kwargs):
+    def __call__(self, *args, capture=False, check=True):
+        self.events.append((args, {"capture": capture, "check": check}))
         if args[0] == "stop":
-            events.append("stop")
-        if args[0] == "up":
-            events.append("start")
-        return SimpleNamespace(returncode=0, stdout="{}")
+            if self.stop_error:
+                raise subprocess.CalledProcessError(1, ["docker", "compose", *args])
+            self.stopped = True
+        if args[0] == "ps":
+            if self.ps_error:
+                raise subprocess.CalledProcessError(1, ["docker", "compose", *args])
+            if self.still_running:
+                return SimpleNamespace(stdout="a-running-worker\n")
+            self.confirmed_stopped = self.stopped
+            return SimpleNamespace(stdout="")
+        return SimpleNamespace(stdout="fixture\n")
 
-    def script(name, *args, **kwargs):
-        if name == "reliability.py":
-            destination = args[args.index("--output") + 1].removeprefix("/results/")
-            (experiment.output / destination).write_text('{"status": "passed"}')
-        elif args[0] == "seed":
-            events.append("seed")
-        elif args[0] == "wait-idle":
-            assert kwargs["standalone"] is True
-            events.append("drain")
-            if drain_failure:
-                raise RuntimeError("Database clients did not disconnect")
+    def driver(self, action):
+        self.events.append((("driver", action), {}))
+        if action == "execute":
+            if self.execute_error:
+                raise subprocess.CalledProcessError(1, ["driver", "execute"])
+            (self.output / "execution.json").write_text(json.dumps({
+                "records": [], "passive_drain_actual_s": 0.1,
+            }))
+        if action == "snapshot":
+            if not self.confirmed_stopped:
+                raise AssertionError("Snapshot ran before shutdown was confirmed")
+            (self.output / "snapshot.json").write_text("[]")
 
-    def load(run, folder, duration):
-        phase = "warmup" if folder.name == "warmup" else "measurement"
-        events.append(f"load:{phase}")
-        (folder / "summary.json").write_text(json.dumps(warmup if phase == "warmup" else summary()))
-        return 99 if phase == "warmup" else 0
 
-    def verify(run, folder, *, standalone=False):
-        phase = "warmup" if folder.name == "warmup" else "measurement"
-        assert standalone == (with_errors and phase == "warmup")
-        events.append(f"verify:{phase}")
-        return {"status": "inconclusive" if standalone else "passed"}
+class RunnerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.args = run.arguments(["--duration", "0.1", "--drain-seconds", "0.1"])
+        self.instances = []
 
-    experiment.capture_metadata = lambda: None
-    experiment.command = lambda *args, **kwargs: SimpleNamespace(stdout="{}")
-    experiment.compose_command = compose
-    experiment.api_script = script
-    experiment.load = load
-    experiment.verify = verify
+    def execute_case(self, mode="event_driven", **faults):
+        def compose_factory(project, env):
+            instance = FakeCompose(project, env, **faults)
+            self.instances.append(instance)
+            return instance
 
-    code = experiment.execute()
-    if drain_failure:
-        assert code == 1
-        assert not experiment.rows
-        assert "load:measurement" not in events
-        assert events[-1] == "drain"
-        assert experiment.manifest["status"] == "error"
-        assert "Database clients did not disconnect" in experiment.manifest["error"]
-        return
-    assert code == 0
-    row = experiment.rows[0]
-    assert row["warmup_status"] == "failed"
-    assert row["warmup_dropped_iterations"] == 5
-    assert row["status"] == "passed"
-    assert row["warmup_recovery"] == ("api_restarted" if with_errors else "none")
-    assert events.index("verify:warmup") < events.index("load:measurement")
-    if with_errors:
-        index = events.index("load:warmup")
-        assert events[index:index + 7] == [
-            "load:warmup", "stop", "drain", "verify:warmup", "start", "seed", "load:measurement",
+        with patch.object(run, "Compose", side_effect=compose_factory), \
+                patch.object(run, "build_report", return_value={"status": "pass"}) as report, \
+                redirect_stdout(io.StringIO()):
+            result = run.run_case(self.args, mode, "create", 10, 1, self.root)
+        return result, report
+
+    def test_measurement_waits_for_execute_stop_and_confirmation_in_both_modes(self):
+        for mode in run.MODES:
+            with self.subTest(mode=mode):
+                result, report = self.execute_case(mode)
+                compose = self.instances[-1]
+                events = [args for args, _ in compose.events]
+                services = ("api", "worker") if mode == "event_driven" else ("api",)
+                stop = ("stop", "--timeout", "10", *services)
+                confirm = ("ps", "--status", "running", "-q", *services)
+                self.assertLess(events.index(("driver", "execute")), events.index(stop))
+                self.assertLess(events.index(stop), events.index(confirm))
+                self.assertLess(events.index(confirm), events.index(("driver", "snapshot")))
+                self.assertEqual([event for event in events if event[0] == "driver"], [
+                    ("driver", "prepare"), ("driver", "ready"),
+                    ("driver", "execute"), ("driver", "snapshot"),
+                ])
+                self.assertEqual(result["status"], "pass")
+                self.assertTrue(compose.confirmed_stopped)
+                report.assert_called_once()
+                saved = json.loads(Path(result["report"]).read_text())
+                lifecycle = saved["lifecycle"]
+                self.assertLessEqual(
+                    datetime.fromisoformat(lifecycle["execution_finished_at"]),
+                    datetime.fromisoformat(lifecycle["measurement_started_at"]),
+                )
+                self.assertEqual(lifecycle["passive_drain_s"], 0.1)
+                self.assertEqual(saved["config"]["project"], compose.project)
+                self.assertEqual(compose.config_path, compose.output / "compose.resolved.yml")
+                self.assert_scoped_cleanup(compose)
+
+    def assert_scoped_cleanup(self, compose):
+        self.assertRegex(compose.project, r"^rfbench-[0-9a-f]{16}$")
+        down_calls = [(args, kwargs) for args, kwargs in compose.events if args[0] == "down"]
+        self.assertEqual(down_calls, [(
+            ("down", "--volumes", "--remove-orphans", "--timeout", "10"),
+            {"capture": False, "check": False},
+        )])
+        self.assertEqual(compose.events[-1], down_calls[0])
+
+    def assert_no_measurement(self, fault, exception):
+        with self.assertRaises(exception):
+            self.execute_case(**{fault: True})
+        compose = self.instances[-1]
+        self.assertNotIn(("driver", "snapshot"), [args for args, _ in compose.events])
+        self.assertFalse((compose.output / "report.json").exists())
+        self.assertFalse((compose.output / "snapshot.json").exists())
+        error = json.loads((compose.output / "error.json").read_text())
+        self.assertNotIn("measurement_started_at", error["lifecycle"])
+        self.assertEqual(error["type"], exception.__name__)
+        self.assert_scoped_cleanup(compose)
+
+    def test_stop_failure_prevents_snapshot_and_still_cleans_up(self):
+        self.assert_no_measurement("stop_error", subprocess.CalledProcessError)
+
+    def test_running_process_after_stop_prevents_snapshot_and_still_cleans_up(self):
+        self.assert_no_measurement("still_running", RuntimeError)
+
+    def test_failure_to_confirm_shutdown_prevents_snapshot_and_still_cleans_up(self):
+        self.assert_no_measurement("ps_error", subprocess.CalledProcessError)
+
+    def test_execution_failure_prevents_snapshot_and_still_cleans_up(self):
+        self.assert_no_measurement("execute_error", subprocess.CalledProcessError)
+
+    def test_separate_cases_get_unique_projects_despite_inherited_compose_name(self):
+        with patch.dict(os.environ, {"COMPOSE_PROJECT_NAME": "return-flow"}):
+            self.execute_case("postgres_pool")
+            self.execute_case("event_driven")
+        first, second = self.instances
+        self.assertNotEqual(first.project, second.project)
+        for compose in self.instances:
+            self.assert_scoped_cleanup(compose)
+            self.assertNotEqual(compose.project, "return-flow")
+
+
+class ComposeIsolationTests(unittest.TestCase):
+    def test_frozen_configuration_is_used_for_shutdown_and_cleanup(self):
+        compose = run.Compose("rfbench-0123456789abcdef", {})
+        compose.config_path = Path("/tmp/case/compose.resolved.yml")
+        with patch.object(run.subprocess, "run") as docker:
+            compose("down", "--volumes", check=False)
+        self.assertEqual(docker.call_args.args[0][5], "/tmp/case/compose.resolved.yml")
+
+    def test_non_benchmark_projects_are_rejected_before_any_docker_command(self):
+        with patch.object(run.subprocess, "run") as docker:
+            for project in ("return-flow", "", "production", "rfbench", "other-rfbench-123"):
+                with self.subTest(project=project), self.assertRaises(ValueError):
+                    run.Compose(project, {})
+            docker.assert_not_called()
+
+    def test_cleanup_command_explicitly_targets_generated_project_and_benchmark_file(self):
+        project = "rfbench-0123456789abcdef"
+        env = {"COMPOSE_PROJECT_NAME": "return-flow"}
+        with patch.object(run.subprocess, "run") as docker:
+            run.Compose(project, env)("down", "--volumes", "--remove-orphans", check=False)
+        docker.assert_called_once_with(
+            ["docker", "compose", "-p", project, "-f", str(run.HERE / "compose.yml"),
+             "down", "--volumes", "--remove-orphans"],
+            env=env, check=False, text=True, stdout=None,
+        )
+
+
+class ArgumentTests(unittest.TestCase):
+    def test_invalid_cli_values_fail_before_docker_or_output_creation(self):
+        cases = [
+            ["--rates", "0"], ["--rates", "nan"], ["--rates", "inf"],
+            ["--duration", "-1"], ["--duration", "nan"],
+            ["--timeout", "0"], ["--drain-seconds", "-1"], ["--drain-seconds", "inf"],
+            ["--concurrency", "0"], ["--concurrency", "1.5"],
+            ["--pool-size", "-1"], ["--worker-concurrency", "0"],
+            ["--repetitions", "0"], ["--stop-timeout", "0"],
+            ["--app-cpus", "nan"], ["--db-cpus", "0"],
+            ["--broker-cpus", "-1"], ["--client-cpus", "inf"],
+            ["--operations", "flow"], ["--adapters", "production"],
         ]
-    else:
-        assert "stop" not in events
-    report = (experiment.output / "report.md").read_text()
-    assert "Warmup (excluded from measurements)" in report
-    assert "failed" in report
-    assert "api_restarted" in report
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "should-not-exist"
+            with patch.object(run, "Compose") as compose, redirect_stderr(io.StringIO()):
+                for argv in cases:
+                    with self.subTest(argv=argv), self.assertRaises(SystemExit) as error:
+                        run.main([*argv, "--output", str(output)])
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertFalse(output.exists())
+                compose.assert_not_called()
+
+    def test_zero_drain_and_fractional_resource_limits_are_valid(self):
+        args = run.arguments(["--drain-seconds", "0", "--app-cpus", "0.5", "--rates", "0.1"])
+        self.assertEqual(args.drain_seconds, 0)
+        self.assertEqual(args.app_cpus, 0.5)
+        self.assertEqual(args.rates, [0.1])
+
+    def test_smoke_has_bounded_work_but_preserves_explicit_scenario_selection(self):
+        args = run.arguments(["--smoke", "--operations", "return", "--adapters", "event_driven"])
+        self.assertEqual((args.duration, args.rates, args.repetitions, args.drain_seconds), (2, [5], 1, 1))
+        self.assertEqual(args.operations, ["return"])
+        self.assertEqual(args.adapters, ["event_driven"])
 
 
-def test_missing_resource_samples_are_explicit_instead_of_implying_zero_usage(tmp_path):
-    coverage = sample_coverage(tmp_path / "resources.jsonl")
-    assert coverage["samples_by_service"] == {"api": 0, "postgres": 0, "k6": 0}
-    assert len(coverage["warnings"]) == 3
+class BusinessIntegrityTests(unittest.TestCase):
+    def test_completed_create_requires_the_matching_persisted_delivery(self):
+        item = {"operation": "create"}
+        command = {"status": "completed", "result": {"id": "delivery-1", "status": "pending"}}
+        self.assertTrue(driver.business_is_valid(item, command, {"id": "delivery-1", "status": "pending"}, None))
+        for delivery in (None, {"id": "another", "status": "pending"},
+                         {"id": "delivery-1", "status": "delivered"}):
+            with self.subTest(delivery=delivery):
+                self.assertFalse(driver.business_is_valid(item, command, delivery, None))
+
+    def test_return_requires_matching_parent_and_real_delivered_delivery(self):
+        item = {"operation": "return", "delivery_id": "delivery-1"}
+        returned = {"id": "return-1", "delivery_id": "delivery-1", "status": "requested"}
+        command = {"result": dict(returned)}
+        delivery = {"id": "delivery-1", "status": "delivered"}
+        self.assertTrue(driver.business_is_valid(item, command, delivery, returned))
+        invalid = [
+            (None, returned), (delivery, None),
+            ({**delivery, "status": "pending"}, returned),
+            (delivery, {**returned, "delivery_id": "another"}),
+            (delivery, {**returned, "id": "another"}),
+        ]
+        for parent, child in invalid:
+            with self.subTest(parent=parent, child=child):
+                self.assertFalse(driver.business_is_valid(item, command, parent, child))
+
+    def test_deliver_cannot_validate_a_different_delivery_or_pending_status(self):
+        item = {"operation": "deliver", "delivery_id": "delivery-1"}
+        command = {"result": {"id": "delivery-1", "status": "delivered"}}
+        self.assertTrue(driver.business_is_valid(item, command, {"id": "delivery-1", "status": "delivered"}, None))
+        for delivery in ({"id": "another", "status": "delivered"},
+                         {"id": "delivery-1", "status": "pending"}, None):
+            with self.subTest(delivery=delivery):
+                self.assertFalse(driver.business_is_valid(item, command, delivery, None))
+
+    def test_malformed_command_result_cannot_pass_integrity(self):
+        for result in (None, [], "invalid", 42, {}):
+            with self.subTest(result=result):
+                self.assertFalse(driver.business_is_valid({"operation": "create"}, {"result": result}, None, None))
 
 
-@pytest.mark.parametrize("options", [
-    ["--rates", "0"], ["--pool-timeout", "nan"], ["--request-timeout", "inf"],
-    ["--preallocated-vus", "30", "--max-vus", "10"], ["--rates", "10", "10"],
-    ["--app-cpus", "0"], ["--command-timeout", "nan"], ["--poll-interval", "0"],
-    ["--poll-interval", "2", "--poll-max-interval", "1"], ["--drain-timeout", "nan"],
-    ["--publish-concurrency", "0"], ["--worker-concurrency", "0"],
-    ["--worker-concurrency", "-1"], ["--scenarios", "read"],
-])
-def test_invalid_configuration_is_rejected_before_creating_containers(options):
-    with pytest.raises(SystemExit):
-        arguments(options)
+class DriverPhaseTests(unittest.TestCase):
+    def test_execute_finishes_passive_drain_before_writing_receipts_and_never_reads_backend(self):
+        events = []
+        config = {
+            "mode": "event_driven", "rate": 10, "duration": 0.1,
+            "concurrency": 2, "timeout": 1, "drain_seconds": 3,
+        }
+        plan = [{"operation": "create", "command_id": "known-id"}]
 
+        def execute(*args):
+            events.append("execute")
+            self.assertEqual(args, ("http://api:8000", "event_driven", plan, 10, 0.1, 2, 1))
+            return {"records": [{"command_id": "known-id"}]}
 
-def test_queued_results_use_committed_outcomes_not_acceptance_or_k6_completed():
-    data = summary(attempted=10, completed=0)
-    data["benchmark"] = {"version": 4}
-    data["metrics"]["workflows_submitted"] = {"values": {"count": 10}}
-    data["metrics"]["commands_completed"] = {"values": {"count": 20}}
-    audit = {"status": "passed", "counts": {"commands_completed": 30, "commands_failed": 0},
-             "flows": {"attempted": 10, "completed": 10, "elapsed_seconds": 15,
-                       "completion_p50_ms": 500, "completion_p95_ms": 1500,
-                       "completion_p99_ms": 2000, "failed": 0, "pending": 0,
-                       "missing": 0, "incomplete": 0}}
-    row = result_row({"adapter": "event_driven"}, data, audit, 0, 10)
-    assert row["status"] == "passed"
-    assert row["completed"] == 10
-    assert row["completed_per_s"] == 10 / 15
-    assert row["measured_seconds"] == 15
-    assert row["workflow_p95_ms"] == 1500
-    assert row["commands_completed"] == 30
-    assert row["failed_workflows"] == 0
-
-
-def test_v4_without_flow_audit_cannot_pass_even_with_successful_http():
-    data = summary()
-    data["benchmark"] = {"version": 4}
-    assert result_row({}, data, {"status": "passed"}, 0, 10)["status"] == "failed"
-
-
-def test_late_completed_flow_keeps_its_transport_error_visible():
-    data = summary(attempted=1, completed=0, errors=1, unknown=1)
-    data["benchmark"] = {"version": 4}
-    audit = {"status": "passed", "flows": {"attempted": 1, "completed": 1, "elapsed_seconds": 12}}
-    row = result_row({}, data, audit, 99, 10)
-    assert row["completed"] == 1
-    assert row["failed_workflows"] == 0
-    assert row["http_requests_failed"] == row["unknown_writes"] == 1
-    assert row["status"] == "failed"
-
-
-@pytest.mark.parametrize("drain_status", ["passed", "timed_out"])
-def test_worker_drains_after_load_before_stop_and_offline_audit(tmp_path, monkeypatch, drain_status):
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    monkeypatch.setattr(runner, "ResourceSampler", lambda *args: nullcontext())
-    experiment = Experiment(arguments(["--adapters", "event_driven"]))
-    experiment.current_variant = "event_driven"
-    folder = experiment.output / "measurement"
-    events = []
-
-    def load(run, destination, duration):
-        events.append("load")
-        (destination / "summary.json").write_text(json.dumps(summary()))
-        return 0
-
-    def script(name, *args, **kwargs):
-        output = experiment.output / args[args.index("--output") + 1].removeprefix("/results/")
-        if name == "database.py":
-            assert args[0] == "drain"
-            assert kwargs["allowed"] == (0, 1)
-            assert kwargs["standalone"] is True
+        def sleep(seconds):
             events.append("drain")
-            output.write_text(json.dumps({"status": drain_status, "waited_seconds": 2}))
-        else:
-            events.append("inspect")
-            output.write_text(json.dumps({"queues": {"pending": {"ready": 0}, "failed": {"ready": 0}}}))
+            self.assertEqual(seconds, 3)
 
-    def verify(run, destination, *, standalone=False):
-        assert standalone
-        events.append("audit")
-        return {"status": "passed"}
+        original_write = driver.write_json
 
-    experiment.load = load
-    experiment.api_script = script
-    experiment.quiesce = lambda destination: events.append("stop")
-    experiment.verify = verify
-    def compose(*args, **kwargs):
-        if args[0] == "stop":
-            assert args[-1] == "api"
-            events.append("stop-api")
-    experiment.compose_command = compose
-    row = experiment.run_phase({"adapter": "event_driven"}, folder, 10)
-    assert events == ["load", "stop-api", "drain", "stop", "audit", "inspect"]
-    assert row["command_drain_status"] == drain_status
-    assert row["status"] == ("passed" if drain_status == "passed" else "failed")
+        def write_json(path, value):
+            events.append("write")
+            self.assertEqual(events, ["execute", "drain", "write"])
+            original_write(path, value)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary)
+            (results / "config.json").write_text(json.dumps(config))
+            (results / "plan.json").write_text(json.dumps(plan))
+            with patch.object(driver, "RESULTS", results), \
+                    patch.object(sys, "argv", ["driver.py", "execute"]), \
+                    patch.object(driver, "execute", side_effect=execute), \
+                    patch.object(driver.time, "sleep", side_effect=sleep), \
+                    patch.object(driver, "write_json", side_effect=write_json), \
+                    patch.object(driver, "connect_when_ready") as database, \
+                    patch.object(driver, "prepare") as prepare, \
+                    patch.object(driver, "ready") as ready, \
+                    patch.object(driver, "snapshot") as snapshot:
+                driver.main()
+            for backend_read in (database, prepare, ready, snapshot):
+                backend_read.assert_not_called()
+            self.assertEqual(events, ["execute", "drain", "write"])
+            receipts = json.loads((results / "execution.json").read_text())
+            self.assertEqual(receipts["records"], [{"command_id": "known-id"}])
+            self.assertGreaterEqual(receipts["passive_drain_actual_s"], 0)
 
 
-def test_removed_connection_per_operation_variant_is_rejected():
-    with pytest.raises(SystemExit):
-        arguments(["--adapters", "postgres"])
+if __name__ == "__main__":
+    unittest.main()
