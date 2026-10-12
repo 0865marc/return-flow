@@ -1,0 +1,6 @@
+flowchart LR
+    preparation["Preparación - fixtures y calentamiento"]
+    execution["Ejecución sin polling - 15 s de POST, drenaje HTTP y 15 s pasivos"]
+    stop["Parada - API y worker detenidos"]
+    measurement["Medición posterior - snapshot SQL, integridad y analíticas"]
+    preparation --> execution --> stop --> measurement

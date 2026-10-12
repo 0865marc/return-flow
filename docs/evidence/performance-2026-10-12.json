@@ -1,0 +1,705 @@
+{
+  "schema_version": 1,
+  "title": "Return Flow: acceptance versus completion, 12 October 2026",
+  "provenance": {
+    "experiment_date": "2026-10-12",
+    "application_commit_archived_after_experiments": "8dceee0f07d4c258ef7a8ef8c313086824b9ed68",
+    "benchmark_commit_archived_after_experiments": "df2b23be5c6a730c27d2d1f786ed8b73f68a6429",
+    "git_commit_recorded_at_run_time": null,
+    "note": "These commits archived the changes after the experiments. They are not recorded runtime checkout IDs. Runtime container image IDs provide the available binary provenance; the source-to-image build attestation was not recorded.",
+    "runtime_images": {
+      "api": "sha256:67e86a62534bc2dc2bd14c4e1ea17322863094dc999e32d963d96edd137dc54a",
+      "worker": "sha256:67e86a62534bc2dc2bd14c4e1ea17322863094dc999e32d963d96edd137dc54a",
+      "postgres": "sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+      "rabbitmq": "sha256:2cb43283d8bbd3caa6c0f0dc00e96c8de772df33df7fd8af6aee4d605aeb8ada"
+    },
+    "image_tags": {
+      "application": "return-flow-benchmark-v2:local",
+      "postgres": "postgres:17-alpine",
+      "rabbitmq": "rabbitmq:4-alpine",
+      "client_three_cpu": "grafana/k6:1.6.1"
+    },
+    "platform": "linux/amd64",
+    "raw_artifacts_committed": false,
+    "raw_artifact_identifiers_base": "benchmarks/results/",
+    "sources": [
+      {
+        "artifact": "20261012T112252Z-7f5fee7d/saturation.json",
+        "sha256": "e831c9b50ea93315abdee371b792cfadaddcb12937b8c4b8a22687969c5c39a4"
+      },
+      {
+        "artifact": "20261012T112252Z-7f5fee7d/run-context.json",
+        "sha256": "08b5cd3d0765503016e76b993d5cf9d64bdda00a8665a214dedc7c51349e9b1f"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/comparison.json",
+        "sha256": "903337e2e53cc8f958760a953e4fd62efe1da6bd1b426318bcebb5796144edb4"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/completion-timing.json",
+        "sha256": "fcba9ad6bf5d32e7a124020a59089a75d56a8c530fa27e2c0aa2dde838977d0d"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/load.js",
+        "sha256": "4007bfb30be07b54842e3b51d09ba2e33f2960e08df11ff2f2a3537e8858a47b"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/run_pair.py",
+        "sha256": "d0da1efdcc8f3aac8fe3b6481368935ec22d75983f8023e37bc90b76518f999b"
+      },
+      {
+        "artifact": "admission-diagnosis-20261012T115137Z/diagnosis.json",
+        "sha256": "3ef9f093ad7b59ea166e1ba307ea07455905ef270c01f6a1cae3438753fb65cf"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/postgres_pool/config.json",
+        "sha256": "1fb837b3071965438e1177c83808617aaace1d119eac00fb26d4c0df5089bac4"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/postgres_pool/actual-limits.json",
+        "sha256": "d98727184cd004396f122c1369ad73b3e403a280005ec104804df8e34491bab4"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/postgres_pool/k6-summary.json",
+        "sha256": "99b225e88d433362fb15c3f7d803b9c7b19f74371a9a8720c45aace8604c104b"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/event_driven/config.json",
+        "sha256": "fa9f4c0cac19d9d683c679c4c261c0b14a849909cea922b1d6dee074660c4c1c"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/event_driven/actual-limits.json",
+        "sha256": "3dc17717797fb1c1920e8d65ed3b128e276369db48cd4f98d3c0db66ce6463c1"
+      },
+      {
+        "artifact": "three-cpu-20261012T115957Z/event_driven/k6-summary.json",
+        "sha256": "fc92428fbc016921f4f76d888904e84ceb3345432856a29a958d15b51350b13f"
+      }
+    ]
+  },
+  "common_method": {
+    "operation": "return",
+    "fixtures": "One distinct delivered delivery per planned request, inserted before load; unique Idempotency-Key per command.",
+    "offered_requests_per_second": 2000,
+    "planned_requests_per_variant": 30000,
+    "submission_seconds": 15,
+    "passive_drain_seconds_after_http_drain": 15,
+    "repetitions_per_variant": 1,
+    "sequential_isolated_cases": true,
+    "backend_state_polling_during_load": false,
+    "database_measurement": "Snapshot and business integrity reconciliation after API and worker stop.",
+    "pool_max_connections_per_process": 10,
+    "worker_concurrency": 8,
+    "publisher_concurrency_per_api_process": 64,
+    "common_cpu_limits": {
+      "postgres": 1,
+      "rabbitmq_when_present": 1,
+      "client": 4
+    },
+    "host_isolation": "Containers share the same physical host; CPU quota equality is not physical isolation. Existing development workloads were not removed.",
+    "total_infrastructure_cpu_equal": false,
+    "cpu_budget_note": "Application budget means API plus worker. RabbitMQ is one additional CPU in event-driven cases."
+  },
+  "three_cpu": {
+    "artifact_group": "three-cpu-20261012T115957Z",
+    "generator": {
+      "name": "k6",
+      "version": "1.6.1",
+      "executor": "constant-arrival-rate",
+      "preallocated_vus": 512,
+      "max_vus": 512,
+      "cpu_limit": 4,
+      "local_counters_and_response_validation_during_load": true,
+      "per_request_send_timestamps_recorded": false
+    },
+    "application_instrumentation": false,
+    "rate_definition": "All valid HTTP responses divided by the 15 s submission window, including responses returned during HTTP drain.",
+    "http_latency_definition": "k6 http_req_duration: sending, waiting and receiving; connection blocking/setup excluded.",
+    "cpu_interval_definition": "Counter differences around k6 process: includes client initialization and HTTP drain, excludes passive command drain.",
+    "reproducibility": "Historical ad hoc k6 harness; not directly reproduced by the committed standard runner. The standard runner splits --app-cpus equally in event mode.",
+    "results": [
+      {
+        "mode": "postgres_pool",
+        "scenario_started_at": "2026-10-12T12:00:02.998000+00:00",
+        "application_cpu_limits": {
+          "api": 3.0,
+          "api_processes": 3,
+          "worker": 0.0
+        },
+        "k6_exit_code": 99,
+        "counts": {
+          "transport_failures": 0,
+          "unexpected_statuses": 0,
+          "dropped_iterations": 10282,
+          "requests_attempted": 19719,
+          "failed_iterations": 0,
+          "invalid_bodies": 0,
+          "plan_errors": 0,
+          "started_but_not_returned": 0,
+          "iterations_returned": 19719,
+          "iterations_completed_builtin": 19719,
+          "responses_received": 19719,
+          "planned": 30000,
+          "iterations_started": 19719,
+          "http_requests_builtin": 19719,
+          "accepted": 19719
+        },
+        "accepted_per_submission_second": 1314.6,
+        "http_ms": {
+          "p(90)": 557.316067,
+          "p(95)": 590.2638340999999,
+          "p(99)": 686.6955689,
+          "max": 798.824179,
+          "count": 19719,
+          "avg": 385.03339500542637,
+          "min": 24.359209,
+          "med": 350.392064
+        },
+        "wall_ms": {
+          "max": 799,
+          "count": 19719,
+          "avg": 384.7726051016786,
+          "min": 25,
+          "med": 350,
+          "p(90)": 557,
+          "p(95)": 590,
+          "p(99)": 686.8199999999997
+        },
+        "completed": 19719,
+        "valid_completed": 19719,
+        "failed": 0,
+        "pending": 0,
+        "missing_attempted": 0,
+        "unexpected_commands": 0,
+        "database_execution_ms": {
+          "count": 19719,
+          "min": 0.9309999999999999,
+          "mean": 13.976010243927176,
+          "p50": 8.968,
+          "p95": 46.39939999999999,
+          "p99": 53.16128,
+          "max": 120.09599999999999
+        },
+        "cpu": {
+          "api": {
+            "used_seconds": 35.272065,
+            "average_cores": 2.1632303210197166,
+            "throttled_seconds": 0.0
+          },
+          "postgres": {
+            "used_seconds": 15.353344,
+            "average_cores": 0.9416182259203181,
+            "throttled_seconds": 46.344206
+          }
+        },
+        "cpu_counter_interval_s": 16.305274874001043,
+        "generator_boundary": {
+          "scheduled_arrival_count": 30001,
+          "extra_arrivals_vs_planned": 1,
+          "out_of_plan_iteration_guard_count": 0,
+          "planned_requests_not_sent": 10281,
+          "explanation": "k6 scheduled one extra boundary arrival in this 15 s run. Direct: the extra arrival was among drops. Events: index 30000 hit the plan guard before any POST; the 30000 planned POSTs all received valid 202. Raw k6 counters and exit code are preserved."
+        },
+        "completion": {
+          "submission_ended_at": "2026-10-12T12:00:17.998000+00:00",
+          "terminal_by_submission_end": 19241,
+          "completed_by_submission_end": 19241,
+          "attempted_awaiting_terminal_at_submission_end": 478,
+          "observed_terminal_commands": 19719,
+          "all_attempted_commands_terminal": true,
+          "missing_attempted_in_snapshot": 0,
+          "last_observed_terminal_at": "2026-10-12T12:00:18.381281+00:00",
+          "seconds_from_scenario_start_to_last_observed_terminal": 15.383281005859375,
+          "seconds_from_scenario_start_until_all_attempted_terminal": 15.383281005859375
+        }
+      },
+      {
+        "mode": "event_driven",
+        "scenario_started_at": "2026-10-12T12:00:43.766000+00:00",
+        "application_cpu_limits": {
+          "api": 2.0,
+          "api_processes": 2,
+          "worker": 1.0
+        },
+        "k6_exit_code": 99,
+        "counts": {
+          "requests_attempted": 30000,
+          "http_requests_builtin": 30000,
+          "invalid_bodies": 0,
+          "plan_errors": 1,
+          "dropped_iterations": 0,
+          "iterations_started": 30001,
+          "iterations_returned": 30001,
+          "transport_failures": 0,
+          "iterations_completed_builtin": 30001,
+          "started_but_not_returned": 0,
+          "planned": 30000,
+          "responses_received": 30000,
+          "accepted": 30000,
+          "failed_iterations": 1,
+          "unexpected_statuses": 0
+        },
+        "accepted_per_submission_second": 2000.0,
+        "http_ms": {
+          "p(95)": 21.660080449999956,
+          "p(99)": 165.70965704999998,
+          "max": 224.65408,
+          "count": 30000,
+          "avg": 8.404421389500026,
+          "min": 0.827342,
+          "med": 2.4917395,
+          "p(90)": 9.5298312
+        },
+        "wall_ms": {
+          "max": 250,
+          "count": 30000,
+          "avg": 8.563866666666666,
+          "min": 0,
+          "med": 3,
+          "p(90)": 10,
+          "p(95)": 22,
+          "p(99)": 168
+        },
+        "completed": 26329,
+        "valid_completed": 26329,
+        "failed": 0,
+        "pending": 0,
+        "missing_attempted": 3671,
+        "unexpected_commands": 0,
+        "database_execution_ms": {
+          "count": 26329,
+          "min": 0.945,
+          "mean": 4.475442895666376,
+          "p50": 4.252,
+          "p95": 5.9239999999999995,
+          "p99": 7.058880000000005,
+          "max": 46.080999999999996
+        },
+        "cpu": {
+          "api": {
+            "used_seconds": 23.498349,
+            "average_cores": 1.4806670648458569,
+            "throttled_seconds": 0.001656
+          },
+          "worker": {
+            "used_seconds": 14.858012,
+            "average_cores": 0.9362261585903128,
+            "throttled_seconds": 0.001584
+          },
+          "postgres": {
+            "used_seconds": 8.727369,
+            "average_cores": 0.5499249262599989,
+            "throttled_seconds": 0.0
+          },
+          "rabbitmq": {
+            "used_seconds": 8.88664,
+            "average_cores": 0.5599608366162995,
+            "throttled_seconds": 0.0
+          }
+        },
+        "cpu_counter_interval_s": 15.870109870003944,
+        "generator_boundary": {
+          "scheduled_arrival_count": 30001,
+          "extra_arrivals_vs_planned": 1,
+          "out_of_plan_iteration_guard_count": 1,
+          "planned_requests_not_sent": 0,
+          "explanation": "k6 scheduled one extra boundary arrival in this 15 s run. Direct: the extra arrival was among drops. Events: index 30000 hit the plan guard before any POST; the 30000 planned POSTs all received valid 202. Raw k6 counters and exit code are preserved."
+        },
+        "completion": {
+          "submission_ended_at": "2026-10-12T12:00:58.766000+00:00",
+          "terminal_by_submission_end": 11686,
+          "completed_by_submission_end": 11686,
+          "attempted_awaiting_terminal_at_submission_end": 18314,
+          "observed_terminal_commands": 26329,
+          "all_attempted_commands_terminal": false,
+          "missing_attempted_in_snapshot": 3671,
+          "last_observed_terminal_at": "2026-10-12T12:01:14.126085+00:00",
+          "seconds_from_scenario_start_to_last_observed_terminal": 30.3600849609375,
+          "seconds_from_scenario_start_until_all_attempted_terminal": null
+        }
+      }
+    ]
+  },
+  "two_cpu": {
+    "artifact_group": "20261012T112252Z-7f5fee7d",
+    "generator": {
+      "name": "Python stdlib http.client",
+      "concurrency": 256,
+      "cpu_limit": 4
+    },
+    "application_cpu_limits": {
+      "postgres_pool": {
+        "api": 2,
+        "api_processes": 2,
+        "worker": 0
+      },
+      "event_driven": {
+        "api": 1,
+        "api_processes": 1,
+        "worker": 1
+      }
+    },
+    "comparability_note": "Different generator and concurrency from three_cpu. Do not interpret the difference as a controlled scaling curve.",
+    "results": [
+      {
+        "mode": "postgres_pool",
+        "counts": {
+          "planned": 30000,
+          "sent": 19218,
+          "dropped": 10782,
+          "unique_sent_commands": 19218,
+          "http_expected_status": 19218,
+          "http_unexpected_status": 0,
+          "http_transport_errors": 0,
+          "http_missing_status": 0,
+          "http_invalid_body": 0,
+          "http_success": 19218,
+          "completed": 19218,
+          "failed": 0,
+          "pending": 0,
+          "missing": 0,
+          "unknown": 0,
+          "completed_despite_http_failure": 0,
+          "completed_despite_invalid_http_body": 0
+        },
+        "drop_reasons": {
+          "capacity": 8146,
+          "generator_lag": 2636
+        },
+        "sent_per_submission_second": 1281.1949159622272,
+        "http_latency_ms": {
+          "count": 19218,
+          "min": 36.09544000210008,
+          "mean": 196.23163925070654,
+          "p50": 197.62627049567527,
+          "p95": 248.31750814992117,
+          "p99": 278.5407216726156,
+          "max": 437.18300799810095,
+          "excluded": {}
+        },
+        "db_internal_latency_ms": {
+          "count": 19218,
+          "min": 1.9269999999999998,
+          "mean": 8.982058694973462,
+          "p50": 8.786999999999999,
+          "p95": 11.966149999999997,
+          "p99": 15.51159999999996,
+          "max": 184.566,
+          "excluded": {}
+        },
+        "max_http_in_flight_reconstructed": 256,
+        "estimated_submitted_without_terminal_at_submission_end": 201,
+        "estimated_last_terminal_after_submission_s": 0.126062
+      },
+      {
+        "mode": "event_driven",
+        "counts": {
+          "planned": 30000,
+          "sent": 22222,
+          "dropped": 7778,
+          "unique_sent_commands": 22222,
+          "http_expected_status": 22222,
+          "http_unexpected_status": 0,
+          "http_transport_errors": 0,
+          "http_missing_status": 0,
+          "http_invalid_body": 0,
+          "http_success": 22222,
+          "completed": 22222,
+          "failed": 0,
+          "pending": 0,
+          "missing": 0,
+          "unknown": 0,
+          "completed_despite_http_failure": 0,
+          "completed_despite_invalid_http_body": 0
+        },
+        "drop_reasons": {
+          "capacity": 6045,
+          "generator_lag": 1733
+        },
+        "sent_per_submission_second": 1481.460802847673,
+        "http_latency_ms": {
+          "count": 22222,
+          "min": 10.321474001102615,
+          "mean": 170.95823327124813,
+          "p50": 167.2131570012425,
+          "p95": 203.59451490076026,
+          "p99": 224.15261017929902,
+          "max": 277.6712869963376,
+          "excluded": {}
+        },
+        "db_internal_latency_ms": {
+          "count": 22222,
+          "min": 0.9940000000000001,
+          "mean": 4.287428809288093,
+          "p50": 4.167,
+          "p95": 5.403,
+          "p99": 5.823,
+          "max": 9.665999999999999,
+          "excluded": {}
+        },
+        "max_http_in_flight_reconstructed": 256,
+        "estimated_submitted_without_terminal_at_submission_end": 9385,
+        "estimated_last_terminal_after_submission_s": 9.708664
+      }
+    ]
+  },
+  "publisher_diagnosis": {
+    "artifact_group": "admission-diagnosis-20261012T115137Z",
+    "cpu_limits": {
+      "api": 1,
+      "worker": 1,
+      "postgres": 1,
+      "rabbitmq": 1,
+      "client": 4
+    },
+    "offered_requests_per_second": 2000,
+    "submission_seconds": 15,
+    "repetitions_per_setting": 1,
+    "uninstrumented_k6_controls": {
+      "k6-plain64": {
+        "k6_exit_code": 99,
+        "counts": {
+          "requests_attempted": 22562,
+          "plan_errors": 0,
+          "dropped_iterations": 7438,
+          "iterations_started": 22562,
+          "iterations_returned": 22562,
+          "failed_iterations": 0,
+          "started_but_not_returned": 0,
+          "planned": 30000,
+          "accepted": 22562,
+          "unexpected_statuses": 0,
+          "iterations_completed_builtin": 22562,
+          "http_requests_builtin": 22562,
+          "responses_received": 22562,
+          "transport_failures": 0,
+          "invalid_bodies": 0
+        },
+        "http_ms": {
+          "avg": 337.82538310247116,
+          "min": 21.067715,
+          "med": 336.44803249999995,
+          "p(90)": 365.33498760000003,
+          "p(95)": 383.1003105,
+          "p(99)": 396.38945472999995,
+          "max": 457.162366,
+          "count": 22562
+        },
+        "wall_ms": {
+          "max": 458,
+          "count": 22562,
+          "avg": 338.01063735484445,
+          "min": 21,
+          "med": 337,
+          "p(90)": 365,
+          "p(95)": 383,
+          "p(99)": 397
+        },
+        "completed": 22562,
+        "valid_completed": 22562,
+        "failed": 0,
+        "pending": 0,
+        "missing_attempted": 0,
+        "unexpected_commands": 0,
+        "note": "Reconciliation assumes single k6 instance and contiguous started iteration indexes; counts expose plan errors.",
+        "accepted_per_submission_second": 1504.1333333333334,
+        "cpu_counter_interval_s": 16.047557584999595,
+        "cpu": {
+          "api": {
+            "used_seconds": 15.018758,
+            "average_cores": 0.9358905815074774,
+            "throttled_seconds": 0.001858
+          },
+          "worker": {
+            "used_seconds": 15.013266,
+            "average_cores": 0.9355483487427149,
+            "throttled_seconds": 0.001801
+          },
+          "postgres": {
+            "used_seconds": 8.159358,
+            "average_cores": 0.5084485883152047,
+            "throttled_seconds": 0.0
+          },
+          "rabbitmq": {
+            "used_seconds": 7.510862,
+            "average_cores": 0.46803770357058916,
+            "throttled_seconds": 0.0
+          }
+        }
+      },
+      "k6-plain256": {
+        "k6_exit_code": 99,
+        "counts": {
+          "plan_errors": 0,
+          "iterations_started": 19571,
+          "iterations_returned": 19571,
+          "requests_attempted": 19571,
+          "transport_failures": 0,
+          "dropped_iterations": 10429,
+          "responses_received": 19571,
+          "failed_iterations": 0,
+          "planned": 30000,
+          "iterations_completed_builtin": 19571,
+          "unexpected_statuses": 0,
+          "invalid_bodies": 0,
+          "started_but_not_returned": 0,
+          "http_requests_builtin": 19571,
+          "accepted": 19571
+        },
+        "http_ms": {
+          "max": 507.353331,
+          "count": 19571,
+          "avg": 390.23317822630565,
+          "min": 14.64582,
+          "med": 397.598187,
+          "p(90)": 435.198367,
+          "p(95)": 453.428871,
+          "p(99)": 483.5907338999999
+        },
+        "wall_ms": {
+          "avg": 390.36339481886466,
+          "min": 15,
+          "med": 398,
+          "p(90)": 435,
+          "p(95)": 454,
+          "p(99)": 483.2999999999993,
+          "max": 508,
+          "count": 19571
+        },
+        "completed": 19571,
+        "valid_completed": 19571,
+        "failed": 0,
+        "pending": 0,
+        "missing_attempted": 0,
+        "unexpected_commands": 0,
+        "note": "Reconciliation assumes single k6 instance and contiguous started iteration indexes; counts expose plan errors.",
+        "accepted_per_submission_second": 1304.7333333333333,
+        "cpu_counter_interval_s": 15.956796086000395,
+        "cpu": {
+          "api": {
+            "used_seconds": 14.990725,
+            "average_cores": 0.9394570764210007,
+            "throttled_seconds": 0.002934
+          },
+          "worker": {
+            "used_seconds": 15.073533,
+            "average_cores": 0.9446465893754623,
+            "throttled_seconds": 0.000316
+          },
+          "postgres": {
+            "used_seconds": 8.509821,
+            "average_cores": 0.5333038633905991,
+            "throttled_seconds": 0.0
+          },
+          "rabbitmq": {
+            "used_seconds": 7.513679,
+            "average_cores": 0.47087641901948496,
+            "throttled_seconds": 0.0
+          }
+        }
+      }
+    },
+    "instrumented_python_controls": {
+      "slots64": {
+        "accepted": 17782,
+        "accepted_per_submission_second": 1185.4666666666667,
+        "http_ms": {
+          "count": 17782,
+          "min": 10.419840000395197,
+          "mean": 214.39816840860803,
+          "p50": 209.7083994995046,
+          "p95": 264.4207455996366,
+          "p99": 291.2906126296729,
+          "max": 334.54984999843873
+        },
+        "stage_means_ms": {
+          "asgi_ms": 210.72092534693684,
+          "publisher_total_ms": 210.33379738223994,
+          "publisher_slot_wait_ms": 157.41294427902167,
+          "publisher_session_ms": 0.0044343166118455506,
+          "amqp_publish_total_ms": 52.843688603234675,
+          "amqp_channel_lock_wait_ms": 48.11852868115357,
+          "amqp_channel_lock_held_ms": 0.0821290383634219,
+          "amqp_write_queue_put_ms": 0.008836478815636368,
+          "amqp_confirmation_wait_ms": 4.596807538947011,
+          "amqp_drain_wait_ms": 0.0
+        },
+        "cpu_average_cores": {
+          "api": 0.9704890071070116,
+          "worker": 0.967204259719481,
+          "postgres": 0.5679132821287755,
+          "rabbitmq": 0.46792710096171247,
+          "bench": 0.31199845631402306
+        },
+        "integrity": {
+          "valid_completed": 17782,
+          "invalid_completed": 0,
+          "unaudited_completed": 0,
+          "issues": []
+        }
+      },
+      "slots256": {
+        "accepted": 16874,
+        "accepted_per_submission_second": 1124.9333333333334,
+        "http_ms": {
+          "count": 16874,
+          "min": 16.092590005428065,
+          "mean": 226.16360719845775,
+          "p50": 225.58778399979929,
+          "p95": 267.12373414811736,
+          "p99": 326.4543360062089,
+          "max": 371.48251100006746
+        },
+        "stage_means_ms": {
+          "asgi_ms": 222.10356460456092,
+          "publisher_total_ms": 221.69124628908892,
+          "publisher_slot_wait_ms": 0.00225239855646932,
+          "publisher_session_ms": 0.0039116896070323925,
+          "amqp_publish_total_ms": 221.6232836820264,
+          "amqp_channel_lock_wait_ms": 216.82748277364703,
+          "amqp_channel_lock_held_ms": 0.08503743415972496,
+          "amqp_write_queue_put_ms": 0.004973310729135994,
+          "amqp_confirmation_wait_ms": 4.652588710752549,
+          "amqp_drain_wait_ms": 0.0
+        },
+        "cpu_average_cores": {
+          "api": 0.9590897212300663,
+          "worker": 0.9676116917888803,
+          "postgres": 0.5766664883046537,
+          "rabbitmq": 0.46075909516492647,
+          "bench": 0.3071588428798877
+        },
+        "integrity": {
+          "valid_completed": 16874,
+          "invalid_completed": 0,
+          "unaudited_completed": 0,
+          "issues": []
+        }
+      }
+    },
+    "limitations": [
+      "One repetition per setting; not a confidence interval or a universal server capacity.",
+      "Detailed stage probes and Python CPU sampling introduce overhead. Capacity control uses the unchanged API image without instrumentation.",
+      "ACK wait includes client transport and local event-loop scheduling; not isolated RabbitMQ processing time.",
+      "CPU counter intervals include preparation/initialization and HTTP drain, and exclude passive command drain.",
+      "Throughput is accepted requests divided by the 15 s offered-load window; responses can finish during HTTP drain.",
+      "Terminal timestamps are generated before PostgreSQL commit. Cross-clock execution timelines are approximate."
+    ],
+    "findings": [
+      "Increasing the publisher window from 64 to 256 moves waiting from the semaphore to channel-lock acquisition; it does not eliminate the admission bottleneck.",
+      "The API process consumes close to its single available core. Delay is predominantly before the AMQP confirm wait.",
+      "The channel lock is held briefly; long acquisition times are not proof that the lock itself consumes most CPU.",
+      "CPU samples distribute cost across HTTP handling, publisher code, AMQP background tasks and event-loop scheduling.",
+      "RabbitMQ confirmation wait and resource usage show no evidence that broker admission is the dominant limit in these runs.",
+      "The worker independently consumes its own CPU budget and processes fewer commands per second than are accepted, so execution queues grow."
+    ]
+  },
+  "timing_limitations": [
+    "completed_at is generated before PostgreSQL COMMIT. It does not record exact committed completion.",
+    "created_at in event mode is generated by the worker and excludes broker queue wait and earlier pool wait.",
+    "Counts at the submission cutoff are reconstructed from the final snapshot, not polled queue length.",
+    "Client/DB UTC clock offset was not calibrated. Cross-clock cutoff and tail estimates inherit this uncertainty.",
+    "Three-CPU events still had 3671 accepted commands unresolved at the stop. Time to finish all accepted work is censored; 30.360 s is only the last observed terminal timestamp.",
+    "One short repetition per setting does not estimate a confidence interval or long-term sustainable capacity."
+  ]
+}

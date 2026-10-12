@@ -1,0 +1,9 @@
+%% Source: docs/evidence/performance-2026-10-12.json, three_cpu.results.
+%% Valid responses / 15 s submission window; responses during HTTP drain included.
+%% Line: offered rate. Bars: observed acceptance, not completed business operations.
+xychart-beta
+    title "Recepción HTTP con 3 CPU de aplicación"
+    x-axis ["Directa: API 3 CPU", "Eventos: API 2 + worker 1 CPU"]
+    y-axis "Respuestas válidas/s" 0 --> 2200
+    bar [1314.6, 2000]
+    line [2000, 2000]

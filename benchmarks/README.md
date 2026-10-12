@@ -4,6 +4,11 @@ Este benchmark compara `postgres_pool` y `event_driven` separando la generación
 
 La separación elimina la carga de observación concurrente del benchmark anterior. No significa un coste absoluto de cero: enviar HTTP, guardar recibos en memoria y registrar timestamps consume recursos, y los contenedores comparten el host. Conviene ejecutar la comparación en un host sin otras cargas relevantes.
 
+Los [resultados del caso de estudio](../docs/performance.md) documentan las
+mediciones y sus límites. El ensayo de alta carga con reparto de 3 CPU para la
+API directa frente a 2 CPU de API + 1 de worker utiliza una
+[receta adicional con k6](../docs/experiments/three_cpu/README.md).
+
 ## Ejecución rápida
 
 Desde la raíz del repositorio, con Python 3 y Docker Compose disponibles:
