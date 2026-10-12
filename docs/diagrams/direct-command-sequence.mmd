@@ -1,0 +1,26 @@
+sequenceDiagram
+    actor C as Cliente
+    participant A as API
+    participant X as CommandExecutor
+    participant S as CommandStore
+    participant U as Casos de uso
+    participant P as PostgreSQL
+    C->>A: POST /returns + Idempotency-Key
+    A->>X: Ejecutar mediante IdempotentDeliveryFlow
+    X->>S: execute(command, handler)
+    S->>P: BEGIN, INSERT si no existe, SELECT FOR UPDATE
+    P-->>S: Comando y contenido original
+    alt Comando nuevo con contenido válido
+        S->>U: Ejecutar dentro de un savepoint
+        U->>P: Leer entrega y escribir devolución
+        Note over U,P: Repositorios unidos a la misma conexión
+        U-->>S: Resultado
+        S->>P: Guardar resultado y completed_at
+    else Mismo contenido y resultado ya guardado
+        Note over S,P: Reutilizar resultado sin repetir el caso de uso
+    end
+    S->>P: COMMIT
+    P-->>S: Confirmado
+    S-->>X: CommandRecord
+    X-->>A: Resultado
+    A-->>C: 201 Created con la devolución

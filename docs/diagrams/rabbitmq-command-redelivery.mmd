@@ -4,7 +4,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant B as Worker B
 
-    %% Diseño propuesto: el registro transaccional de comandos aún no está implementado.
+    %% Flujo implementado: comando y efectos de negocio comparten transacción.
     %% Ejemplo: el primer worker comienza a crear una devolución y se cae sin enviar ACK.
     Q->>A: Entregar comando: crear devolución + command_id
     Note over Q,A: command_id identifica la solicitud y se conserva al reintentar

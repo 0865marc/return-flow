@@ -1,0 +1,36 @@
+{
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Arial, sans-serif",
+    "fontSize": "16px",
+    "primaryColor": "#eff6ff",
+    "primaryTextColor": "#172554",
+    "primaryBorderColor": "#93c5fd",
+    "lineColor": "#64748b",
+    "secondaryColor": "#f0fdf4",
+    "tertiaryColor": "#f8fafc",
+    "xyChart": {
+      "backgroundColor": "#ffffff",
+      "titleColor": "#172554",
+      "xAxisLabelColor": "#334155",
+      "yAxisLabelColor": "#334155",
+      "plotColorPalette": "#2563eb,#f97316"
+    }
+  },
+  "flowchart": {
+    "htmlLabels": false,
+    "curve": "linear",
+    "nodeSpacing": 30,
+    "rankSpacing": 45
+  },
+  "sequence": {
+    "useMaxWidth": false,
+    "wrap": true,
+    "width": 160,
+    "messageMargin": 36
+  },
+  "xyChart": {
+    "width": 800,
+    "height": 420
+  }
+}

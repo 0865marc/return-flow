@@ -1,0 +1,28 @@
+sequenceDiagram
+    actor C as Cliente
+    participant A as API
+    participant R as RabbitMQ
+    participant W as Worker
+    participant S as CommandStore
+    participant P as PostgreSQL
+    C->>A: POST /returns-async + Idempotency-Key
+    A->>R: Publicar comando persistente y mandatory
+    R-->>A: Publisher confirm
+    A-->>C: 202 Accepted + command_id + Location
+    Note over A,P: Este POST no consulta ni escribe en PostgreSQL
+    Note over C,A: GET del comando puede dar 404 hasta el commit
+    Note over R,W: Consumo y respuesta HTTP pueden solaparse
+    R->>W: Entregar comando
+    W->>S: Ejecutar con CommandExecutor
+    S->>P: BEGIN, INSERT si no existe, SELECT FOR UPDATE
+    alt Comando nuevo con contenido válido
+        S->>P: Casos de uso y escrituras de negocio
+        S->>P: Guardar resultado y completed_at
+    else Mismo contenido y resultado completed
+        Note over S,P: Reutilizar resultado, sin repetir escrituras
+    end
+    S->>P: COMMIT
+    P-->>S: Confirmado
+    S-->>W: Resultado completed
+    W->>R: ACK del mensaje
+    Note over W,P: Caída tras COMMIT y antes de ACK: reentrega idempotente
