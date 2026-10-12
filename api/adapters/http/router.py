@@ -54,18 +54,17 @@ DeliveryUpdateFlowDependency = Annotated[DeliveryFlow, Depends(get_delivery_upda
 
 async def _enqueue_command(
     command: Command,
-    store: CommandStore,
     publisher: CommandPublisher | None,
     response: Response,
 ) -> CommandAcceptedResponse:
-    record = await store.register(command)
-    if record.status == "pending":
-        try:
-            if publisher is None:
-                raise MessagingUnavailableError("Messaging is not configured.")
-            await publisher.publish(command)
-        except MessagingUnavailableError as error:
-            raise CommandPublicationUnavailableError(command.command_id) from error
+    # RabbitMQ owns accepted work until the worker commits its command and result.
+    # Retries may publish again; execution deduplicates them in PostgreSQL.
+    try:
+        if publisher is None:
+            raise MessagingUnavailableError("Messaging is not configured.")
+        await publisher.publish(command)
+    except MessagingUnavailableError as error:
+        raise CommandPublicationUnavailableError(command.command_id) from error
     response.headers["Location"] = f"/commands/{command.command_id}"
     return CommandAcceptedResponse(command_id=command.command_id)
 
@@ -80,25 +79,33 @@ async def create_delivery(flow: DeliveryFlowDependency) -> DeliveryResponse:
     "/deliveries-async",
     status_code=status.HTTP_202_ACCEPTED,
     responses={
-        409: {"description": "Idempotency-Key already identifies another command."},
         503: {"description": "Retry this request using the same Idempotency-Key."},
     },
 )
 async def enqueue_create_delivery(
     idempotency_key: IdempotencyKey,
-    store: CommandStoreDependency,
     publisher: CommandPublisherDependency,
     response: Response,
 ) -> CommandAcceptedResponse:
+    """Confirm broker acceptance; command persistence and execution run in the worker."""
     return await _enqueue_command(
-        CreateDeliveryCommand(command_id=idempotency_key), store, publisher, response
+        CreateDeliveryCommand(command_id=idempotency_key), publisher, response
     )
 
 
-@router.get("/commands/{command_id}")
+@router.get(
+    "/commands/{command_id}",
+    responses={
+        404: {
+            "description": "No committed command is visible. Accepted work may still "
+            "be queued or executing; this does not prove it was rejected or lost."
+        },
+    },
+)
 async def get_command(
     command_id: UUID, store: CommandStoreDependency
 ) -> CommandResponse:
+    """Read persisted state; new queued commands become visible after worker commit."""
     record = await store.get(command_id)
     if record is None:
         raise EntityNotFoundError(f"Command {command_id} was not found.")
@@ -125,7 +132,6 @@ async def mark_delivery_delivered(
     "/deliveries/{delivery_id}/deliver-async",
     status_code=status.HTTP_202_ACCEPTED,
     responses={
-        409: {"description": "Idempotency-Key already identifies another command."},
         503: {
             "description": "Retry this request using the returned command_id as Idempotency-Key."
         },
@@ -133,7 +139,6 @@ async def mark_delivery_delivered(
 )
 async def enqueue_delivery(
     delivery_id: UUID,
-    store: CommandStoreDependency,
     publisher: CommandPublisherDependency,
     response: Response,
     idempotency_key: OptionalIdempotencyKey = None,
@@ -142,7 +147,7 @@ async def enqueue_delivery(
     command = EnsureDeliveryDelivered(
         delivery_id=delivery_id, command_id=idempotency_key or uuid4()
     )
-    return await _enqueue_command(command, store, publisher, response)
+    return await _enqueue_command(command, publisher, response)
 
 
 @router.post("/returns", status_code=status.HTTP_201_CREATED)
@@ -158,20 +163,17 @@ async def request_return(
     "/returns-async",
     status_code=status.HTTP_202_ACCEPTED,
     responses={
-        409: {"description": "Idempotency-Key already identifies another command."},
         503: {"description": "Retry this request using the same Idempotency-Key."},
     },
 )
 async def enqueue_request_return(
     body: RequestReturnBody,
     idempotency_key: IdempotencyKey,
-    store: CommandStoreDependency,
     publisher: CommandPublisherDependency,
     response: Response,
 ) -> CommandAcceptedResponse:
     return await _enqueue_command(
         RequestReturnCommand(command_id=idempotency_key, delivery_id=body.delivery_id),
-        store,
         publisher,
         response,
     )

@@ -177,6 +177,56 @@ async def test_concurrent_copies_commit_only_one_business_operation(
         assert await cursor.fetchone() == (1,)
 
 
+async def test_concurrent_conflict_waits_for_first_command_to_commit(
+    command_repositories: Repositories,
+) -> None:
+    store = command_repositories.commands
+    assert store is not None
+    delivery = Delivery(status=DeliveryStatus.DELIVERED)
+    await command_repositories.deliveries.add(delivery)
+    command = RequestReturnCommand(delivery_id=delivery.id)
+    conflicting = RequestReturnCommand(
+        command_id=command.command_id, delivery_id=uuid4()
+    )
+    business_written = asyncio.Event()
+    allow_commit = asyncio.Event()
+    returned: Return | None = None
+
+    async def handler(repositories: Repositories) -> dict[str, str]:
+        nonlocal returned
+        returned = await RequestReturn(
+            repositories.deliveries, repositories.returns
+        ).execute(delivery.id)
+        business_written.set()
+        await allow_commit.wait()
+        return {"return_id": str(returned.id)}
+
+    async def must_not_execute(repositories: Repositories) -> dict[str, str]:
+        pytest.fail("A conflicting command must not execute its business operation")
+
+    first = asyncio.create_task(store.execute(command, handler))
+    second = None
+    try:
+        await asyncio.wait_for(business_written.wait(), timeout=5)
+        second = asyncio.create_task(store.execute(conflicting, must_not_execute))
+        await asyncio.sleep(0.05)
+        assert not second.done()
+        assert await store.get(command.command_id) is None
+        assert returned is not None
+        assert await command_repositories.returns.get(returned.id) is None
+    finally:
+        allow_commit.set()
+        results = await asyncio.gather(
+            first, *([second] if second is not None else []), return_exceptions=True
+        )
+
+    assert len(results) == 2
+    assert results[0].status == "completed"
+    assert isinstance(results[1], IdempotencyConflictError)
+    assert await store.get(command.command_id) == results[0]
+    assert await command_repositories.returns.get(returned.id) == returned
+
+
 @pytest.mark.parametrize("registered", [False, True])
 async def test_cancellation_rolls_back_and_redelivery_can_execute(
     command_repositories: Repositories, registered: bool
@@ -270,13 +320,15 @@ async def test_database_error_rolls_back_savepoint_and_persists_failure(
     assert await store.get(command.command_id) == record
 
 
+@pytest.mark.parametrize("registered", [False, True])
 async def test_lost_connection_before_commit_does_not_report_success(
-    command_repositories: Repositories, database_url: str
+    command_repositories: Repositories, database_url: str, registered: bool
 ) -> None:
     store = command_repositories.commands
     assert store is not None
     command = CreateDeliveryCommand()
-    await store.register(command)
+    if registered:
+        await store.register(command)
     delivery = Delivery()
 
     async def interrupted(repositories: Repositories) -> dict[str, str]:
@@ -291,18 +343,22 @@ async def test_lost_connection_before_commit_does_not_report_success(
 
     assert await command_repositories.deliveries.get(delivery.id) is None
     record = await store.get(command.command_id)
-    assert record is not None and record.status == "pending"
-    assert record.completed_at is None
+    if registered:
+        assert record is not None and record.status == "pending"
+        assert record.completed_at is None
+    else:
+        assert record is None
     assert (await store.execute(command, create_delivery)).status == "completed"
 
 
+@pytest.mark.parametrize("registered", [False, True])
 async def test_completion_timestamp_uses_clock_after_business_operation(
-    command_repositories: Repositories, database_url: str
+    command_repositories: Repositories, database_url: str, registered: bool
 ) -> None:
     store = command_repositories.commands
     assert store is not None
     command = CreateDeliveryCommand()
-    registered = await store.register(command)
+    previous = await store.register(command) if registered else None
     business_finished_at: datetime | None = None
 
     async def handler(repositories: Repositories) -> dict[str, str]:
@@ -317,7 +373,8 @@ async def test_completion_timestamp_uses_clock_after_business_operation(
 
     completed = await store.execute(command, handler)
 
-    assert completed.created_at == registered.created_at
+    if previous is not None:
+        assert completed.created_at == previous.created_at
     assert completed.created_at is not None
     assert completed.completed_at is not None and business_finished_at is not None
     assert completed.created_at <= business_finished_at <= completed.completed_at

@@ -54,7 +54,8 @@ class PostgresCommandStore:
     async def execute(self, command: Command, handler: CommandHandler) -> CommandRecord:
         async with self.connection_factory() as connection:
             async with connection.transaction():
-                # Direct HTTP executes immediately; queued commands arrive registered.
+                # Direct HTTP and the worker both register as part of execution.
+                # Existing records cover retries and previously registered commands.
                 await self._insert_pending(connection, command)
                 record = await self._load(connection, command, lock=True)
                 if record.status == "pending":

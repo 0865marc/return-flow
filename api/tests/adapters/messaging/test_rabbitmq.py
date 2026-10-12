@@ -80,11 +80,12 @@ async def test_command_waits_for_a_worker_and_is_acknowledged_after_commit(
     delivery = Delivery()
     await repositories.deliveries.add(delivery)
     command = EnsureDeliveryDelivered(delivery_id=delivery.id)
-    await repositories.commands.register(command)
+    assert await repositories.commands.get(command.command_id) is None
 
     # No consumer is registered, and closing the producer leaves work queued.
     await publisher.publish(command)
     await publisher.close()
+    assert await repositories.commands.get(command.command_id) is None
     assert (await repositories.deliveries.get(delivery.id)).status == DeliveryStatus.PENDING
 
     channel = await connection.channel()
@@ -106,7 +107,7 @@ async def test_command_waits_for_a_worker_and_is_acknowledged_after_commit(
 
 @pytest.mark.parametrize("first_transport", ["direct", "queued"])
 async def test_http_and_worker_share_one_result_for_the_same_command(
-    repositories, postgres_url, rabbitmq, publisher, monkeypatch, first_transport
+    repositories, postgres_url, rabbitmq, monkeypatch, first_transport
 ) -> None:
     settings, connection = rabbitmq
     monkeypatch.setenv("RABBITMQ_URL", settings.url)
@@ -116,13 +117,12 @@ async def test_http_and_worker_share_one_result_for_the_same_command(
     with TestClient(create_app(postgres_url)) as client:
         if first_transport == "queued":
             assert client.post("/deliveries-async", headers=headers).status_code == 202
-            assert client.get(f"/commands/{command.command_id}").json()["status"] == "pending"
+            assert client.get(f"/commands/{command.command_id}").status_code == 404
         direct = client.post("/deliveries", headers=headers)
         assert direct.status_code == 201
         if first_transport == "direct":
+            # The API publishes completed retries too; only the worker checks SQL.
             assert client.post("/deliveries-async", headers=headers).status_code == 202
-            # Simulate a duplicate publication of the already completed command.
-            await publisher.publish(command)
 
         channel = await connection.channel()
         queue = await channel.get_queue(settings.queue_name)
@@ -164,8 +164,8 @@ async def test_redelivery_after_commit_before_ack_is_safe(
     delivery = Delivery(status=DeliveryStatus.DELIVERED)
     await repositories.deliveries.add(delivery)
     command = RequestReturnCommand(delivery_id=delivery.id)
-    await repositories.commands.register(command)
     await publisher.publish(command)
+    assert await repositories.commands.get(command.command_id) is None
     first_channel = await connection.channel()
     first_queue = await first_channel.get_queue(settings.queue_name)
     original = await next_message(first_queue)
@@ -274,11 +274,13 @@ async def wait_for_command(client, command_id, task, *, status="completed"):
                 await task
                 pytest.fail("Worker stopped before processing the command")
             response = client.get(f"/commands/{command_id}")
-            assert response.status_code == 200
-            command = response.json()
-            if command["status"] != "pending":
-                assert command["status"] == status, command
-                return command
+            # Accepted messages have no SQL record until their worker commits.
+            assert response.status_code in (200, 404)
+            if response.status_code == 200:
+                command = response.json()
+                if command["status"] != "pending":
+                    assert command["status"] == status, command
+                    return command
             # TestClient runs the API in another thread; let this loop run the worker.
             await asyncio.sleep(0.02)
 
@@ -287,7 +289,7 @@ async def wait_for_command(client, command_id, task, *, status="completed"):
 async def test_complete_async_return_flow_and_idempotent_http_retries(
     rabbitmq, postgres_url, monkeypatch
 ) -> None:
-    settings, _ = rabbitmq
+    settings, connection = rabbitmq
     monkeypatch.setenv("RABBITMQ_URL", settings.url)
     monkeypatch.setenv("RABBITMQ_QUEUE", settings.queue_name)
 
@@ -305,12 +307,10 @@ async def test_complete_async_return_flow_and_idempotent_http_retries(
         repeated = client.post("/deliveries-async", headers=create_headers)
         assert repeated.status_code == 202
         assert repeated.json()["command_id"] == create_id
-        pending = client.get(f"/commands/{create_id}")
-        assert pending.status_code == 200
-        assert pending.json()["status"] == "pending"
-        assert pending.json()["result"] is None
+        assert client.get(f"/commands/{create_id}").status_code == 404
         with psycopg.connect(postgres_url) as database:
             assert database.execute("SELECT COUNT(*) FROM deliveries").fetchone() == (0,)
+            assert database.execute("SELECT COUNT(*) FROM commands").fetchone() == (0,)
 
         task = asyncio.create_task(
             run_worker(settings, postgres_url)
@@ -353,12 +353,24 @@ async def test_complete_async_return_flow_and_idempotent_http_retries(
             assert response.json()["command_id"] == return_id
             assert client.get(f"/commands/{return_id}").json()["result"] == returned
 
+            conflicting_delivery_id = str(uuid4())
             conflicting = client.post(
                 "/returns-async",
                 headers=return_headers,
-                json={"delivery_id": str(uuid4())},
+                json={"delivery_id": conflicting_delivery_id},
             )
-            assert conflicting.status_code == 409
+            # Acceptance only confirms publication; payload conflicts are checked
+            # transactionally by the worker and must preserve the first result.
+            assert conflicting.status_code == 202
+            channel = await connection.channel()
+            dead_letters = await channel.get_queue(f"{settings.queue_name}.failed")
+            rejected = await next_message(dead_letters)
+            rejected_command = RequestReturnCommand.model_validate_json(rejected.body)
+            assert str(rejected_command.command_id) == return_id
+            assert str(rejected_command.delivery_id) == conflicting_delivery_id
+            assert rejected.headers["x-death"][0]["reason"] == "rejected"
+            await rejected.ack()
+            assert client.get(f"/commands/{return_id}").json() == completed
             with psycopg.connect(postgres_url) as database:
                 assert database.execute("SELECT COUNT(*) FROM deliveries").fetchone() == (1,)
                 assert database.execute("SELECT COUNT(*) FROM returns").fetchone() == (1,)

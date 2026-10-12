@@ -55,8 +55,11 @@ transacción, tanto en las rutas directas como en el worker. Los repositorios
 ejecutan el mismo SQL sobre la conexión ligada a esa transacción. Las consultas
 obtienen una conexión del pool y la devuelven al terminar. El pool de la API usa
 `autocommit=True`: una lectura aislada no necesita `BEGIN` y `COMMIT` adicionales.
-`register()` y `execute()` siguen abriendo transacciones explícitas, de modo que
-la escritura de negocio y el resultado permanecen atómicos. El pool del worker
+`execute()` abre una transacción explícita, de modo que el registro del comando,
+la escritura de negocio y el resultado permanecen atómicos. En el flujo
+asíncrono es el worker quien realiza esa transacción; la recepción HTTP no
+consulta ni registra comandos en PostgreSQL. El arranque de la API, las rutas
+directas y las consultas siguen necesitando PostgreSQL. El pool del worker
 conserva `autocommit=False`.
 
 | Variable | Valor por defecto | Función |
@@ -77,7 +80,7 @@ inyectar una fábrica explícita mediante `create_app(..., persistence_factory=.
 | Variante de ejecución | Persistencia | Respuesta HTTP |
 |---|---|---|
 | Directa (`postgres_pool` en el benchmark) | PostgreSQL con pool e idempotencia. | `201`/`200` después del commit de la operación. |
-| RabbitMQ (`event_driven` en el benchmark) | El mismo adaptador e idempotencia, ejecutados en el worker. | `202` al aceptar el comando; el resultado se consulta después. |
+| RabbitMQ (`event_driven` en el benchmark) | El worker registra y ejecuta el comando con el mismo adaptador e idempotencia. | `202` tras la confirmación de RabbitMQ, sin acceder a PostgreSQL en la recepción; el resultado se consulta después. |
 
 Las rutas síncronas esperan a los casos de uso y estos esperan a los repositorios mediante
 `await`. El dominio conserva métodos normales: aplicar una regla de negocio no
@@ -298,21 +301,25 @@ Estas rutas utilizan la misma idempotencia que las rutas genéricas.
 
 ## Idempotencia compartida
 
-Cada clave identifica un comando en PostgreSQL. Repetir la misma clave y el
-mismo contenido normalizado conserva el resultado y no crea otra entrega o
-devolución. Reutilizarla para otro tipo de comando o para otros datos devuelve
-`409`. Una clave distinta representa otra operación: dos claves distintas pueden
-crear dos devoluciones de la misma entrega.
+Cada clave identifica un comando en PostgreSQL cuando se ejecuta. Repetir la
+misma clave y el mismo contenido normalizado conserva el resultado y no crea
+otra entrega o devolución. Reutilizarla para otro tipo de comando o para otros
+datos provoca un conflicto: las rutas directas devuelven `409`; las asíncronas
+aceptan el mensaje y el worker detecta el conflicto al procesarlo. Una clave
+distinta representa otra operación: dos claves distintas pueden crear dos
+devoluciones de la misma entrega.
 
 Las claves son globales dentro de la aplicación: las comparten las rutas directas,
 las asíncronas y los formatos Correos/DHL. Por ejemplo, reintentar una devolución
-directa mediante `/returns-async` con la misma clave y entrega recupera el mismo
-comando. Cambiar de formato de transportista conserva el recurso si los datos
+directa mediante `/returns-async` con la misma clave y entrega publica otro
+mensaje cuyo procesamiento reutiliza el resultado guardado. Cambiar de formato
+de transportista conserva el recurso si los datos
 normalizados son los mismos; la respuesta se traduce al formato solicitado.
 
 `CommandExecutor` utiliza `PostgresCommandStore` para bloquear el comando con
 `SELECT ... FOR UPDATE` y ejecutar los casos de uso sobre una misma conexión.
-Las escrituras de negocio y el resultado se confirman en una sola transacción.
+El registro del comando, las escrituras de negocio y el resultado se confirman
+en una sola transacción.
 Las ejecuciones concurrentes del mismo comando esperan el bloqueo y reutilizan
 el resultado. Si falla la ejecución, un savepoint revierte sus escrituras y se
 guarda un resultado `failed`; los fallos de conexión que impiden completar la
@@ -346,30 +353,37 @@ El modelo comienza con una entrega; no existe una entidad de pedido independient
 | Solicitar devolución | `POST /returns-async` | UUID obligatorio. |
 | Consultar estado y resultado | `GET /commands/{command_id}` | No necesita cabecera. |
 
-La API registra primero el comando como `pending` en PostgreSQL y lo publica. El publicador reutiliza una conexión y permite varias
-publicaciones pendientes de confirmación, con un límite configurable. Cada petición
-espera su propia confirmación antes de responder. Un fallo o una cancelación no
-cierra la conexión mientras otras publicaciones todavía la utilizan.
-Cuando RabbitMQ confirma la publicación devuelve `202 Accepted`, con
+La API valida la entrada y publica el comando completo en RabbitMQ sin consultar
+ni escribir en PostgreSQL. El publicador reutiliza una conexión y permite varias
+publicaciones pendientes de confirmación, con un límite configurable. Cada
+petición espera su propia confirmación antes de responder. Un fallo o una
+cancelación no cierra la conexión mientras otras publicaciones todavía la
+utilizan. Cuando RabbitMQ confirma la publicación, la API devuelve `202 Accepted`, con
 `{"command_id": "UUID_DEL_COMANDO", "status": "accepted"}` y la cabecera
 `Location: /commands/UUID_DEL_COMANDO`. El `202` confirma la aceptación; hay que
-consultar el comando para saber si la operación terminó:
+consultar el comando para saber si la operación terminó. El worker crea el
+registro, ejecuta el negocio y guarda el resultado en una sola transacción.
+Por tanto, un comando nuevo no es visible en PostgreSQL hasta el commit:
 
 | Estado | Significado |
 |---|---|
-| `pending` | Todavía no hay un resultado confirmado; `result` y `error` son `null`. |
+| `pending` | Registro previo sin resultado confirmado, conservado por compatibilidad con comandos antiguos; el flujo nuevo no publica este estado antes de ejecutar. |
 | `completed` | `result` contiene la entrega o devolución creada/actualizada, incluido su `id`. |
 | `failed` | `error` describe el fallo; `result` es `null` y las escrituras de negocio se han revertido. |
 
-PostgreSQL conserva `created_at` al registrar cada comando y `completed_at` al
-persistir su resultado terminal, tanto correcto como fallido. Los reintentos
+PostgreSQL conserva `created_at` al registrar cada comando durante su ejecución y
+`completed_at` al persistir su resultado terminal, tanto correcto como fallido.
+El intervalo entre ambos no incluye la espera previa en RabbitMQ. Los reintentos
 conservan esos tiempos. El resultado y la escritura de negocio siguen dentro de
 la misma transacción; `completed_at` se toma justo antes del commit, no mide el
 instante exacto del commit. La actualización del esquema mantiene `NULL` en los
 tiempos históricos desconocidos de comandos anteriores.
 
 `GET /commands/{command_id}` devuelve también `command_id` y `type`. Un comando
-desconocido devuelve `404`. Los estados `completed` y `failed` son definitivos.
+sin registro visible devuelve `404`: puede ser desconocido, estar esperando en
+RabbitMQ o estar ejecutándose en una transacción todavía no confirmada. Un `404`
+después de un `202` no demuestra rechazo ni pérdida; el cliente debe volver a
+consultar para observar el resultado. Los estados `completed` y `failed` son definitivos.
 Las reglas de negocio se comprueban en el worker: una entrega inexistente o
 todavía pendiente puede producir `202` y después un comando `failed`.
 
@@ -384,8 +398,9 @@ curl -i -X POST http://localhost:8000/deliveries-async -H "Idempotency-Key: $CRE
 curl "http://localhost:8000/commands/$CREATE_KEY"
 ```
 
-Repite el último `GET` hasta obtener `completed` y copia `result.id` como
-`DELIVERY_ID`. Si aparece `failed`, revisa `error` antes de continuar.
+Repite el último `GET`, también si inicialmente devuelve `404`, hasta obtener
+`completed` y copia `result.id` como `DELIVERY_ID`. Si aparece `failed`, revisa
+`error` antes de continuar.
 
 ```bash
 DELIVERY_ID=UUID_DE_LA_ENTREGA
@@ -407,13 +422,20 @@ Cuando el último comando esté `completed`, `result.id` permite consultar
 `GET /returns/{return_id}`. El resultado incluye también `delivery_id` y
 `status: requested`.
 
-La clave de idempotencia es el `command_id` y sigue las reglas compartidas por
-ambas variantes. Si el comando sigue `pending`, repetir el POST asíncrono vuelve
-a publicarlo; si terminó, devuelve `202` con el mismo identificador sin
-republicarlo. Esto también se aplica a comandos ejecutados previamente por una
-ruta directa. Un UUID inválido o la ausencia de la cabecera obligatoria devuelve
-`422`. El comando `ensure_delivery_delivered`, utilizado por ambos flujos,
-admite que la entrega ya esté entregada.
+La clave de idempotencia es el `command_id`. Cada POST asíncrono válido publica
+un mensaje y espera la confirmación del broker, incluso si el comando ya terminó
+o se ejecutó previamente por una ruta directa. Por tanto, los reintentos también
+necesitan que RabbitMQ esté disponible. El worker reutiliza el resultado guardado
+para el mismo contenido. Si la clave ya corresponde a otro tipo de comando o a
+otro contenido, la API no responde `409`: el worker rechaza el mensaje sin
+reencolar y lo envía a la cola de fallidos, sin modificar el resultado del
+comando original. Si dos contenidos distintos compiten por una clave nueva,
+prevalece el que consiga registrar y confirmar primero el comando en PostgreSQL,
+desde el worker o una ruta directa; no necesariamente el primer POST aceptado.
+
+Un UUID inválido o la ausencia de la cabecera obligatoria devuelve `422`. El
+comando `ensure_delivery_delivered`, utilizado por ambos flujos, admite que la
+entrega ya esté entregada.
 
 El worker utiliza la transacción idempotente descrita en el apartado anterior.
 Los consumidores del mismo comando esperan el bloqueo y después reutilizan su
@@ -425,8 +447,8 @@ para evitar la espera intermedia de escritura local mientras el canal está
 bloqueado, y sigue esperando la confirmación de RabbitMQ antes de responder `202`.
 El worker procesa hasta ocho comandos concurrentes por defecto; `prefetch` tiene
 el mismo valor que `RABBITMQ_WORKER_CONCURRENCY`. Cada mensaje recibe `ACK` solo
-después de confirmar o recuperar un resultado `completed`; los comandos `failed`
-y los mensajes inválidos se rechazan
+después de confirmar o recuperar un resultado `completed`; los comandos `failed`,
+los conflictos de idempotencia y los mensajes inválidos se rechazan
 sin reencolar y van a `<RABBITMQ_QUEUE>.failed`. Si se pierde la conexión a la base
 de datos o no puede persistirse el resultado, el worker termina sin `ACK` y Compose
 lo reinicia. RabbitMQ puede reentregar el mensaje al cerrarse el canal o conexión.
@@ -439,12 +461,18 @@ orden: el cliente debe seguir esperando la finalización de cada dependencia del
 flujo. Al detenerse el worker, sus tareas se cancelan y terminan antes de cerrar
 la conexión y el pool; los mensajes sin ACK pueden reentregarse.
 
-Esta versión no tiene outbox. Si falla la publicación después del registro, la
-API devuelve `503` con `command_id` y `Location`; el mensaje podría haber llegado
-al broker y el comando puede seguir `pending`. Repite el mismo `POST`, cuerpo y
-`Idempotency-Key` cuando el servicio vuelva a estar disponible. No generes otra
-clave para ese reintento: podría crear otro recurso. No hay un proceso que
-republique automáticamente los comandos pendientes que no llegaron a la cola.
+Esta versión no necesita coordinar una escritura SQL con la publicación desde
+la API: antes de ejecutarse, el trabajo aceptado reside en RabbitMQ. Su
+conservación depende de la durabilidad y disponibilidad del broker; PostgreSQL
+solo conserva los comandos cuya transacción ya se confirmó.
+
+Si falla la publicación o vence su plazo, la API devuelve `503` con `command_id`
+y `Location`; el mensaje podría haber llegado al broker aunque no se recibiera
+su confirmación. Repite el mismo `POST`, cuerpo e `Idempotency-Key` cuando el
+servicio vuelva a estar disponible. No generes otra clave para ese reintento:
+podría crear otro recurso. Los registros `pending` de versiones anteriores que
+nunca llegaron a RabbitMQ siguen requiriendo republicación; no hay un proceso
+que los republique automáticamente.
 
 | Variable | Valor por defecto | Función |
 |---|---|---|
@@ -462,14 +490,15 @@ docker compose stop worker
 ```
 
 Envía `POST /deliveries-async` con una clave nueva desde `/docs`. La respuesta será
-`202`, pero `GET /commands/{command_id}` seguirá mostrando `pending`. Después:
+`202`, pero `GET /commands/{command_id}` devolverá `404` mientras no se confirme
+la ejecución. Después:
 
 ```bash
 docker compose start worker
 docker compose logs -f worker
 ```
 
-El comando pasa a `completed`, con la entrega en `result`, y los logs muestran
+El comando aparece como `completed`, con la entrega en `result`, y los logs muestran
 su `command_id`.
 
 No se eliminan automáticamente los registros de comandos ni se reintentan los
@@ -530,7 +559,8 @@ aplicación. Comprueban el flujo asíncrono completo con PostgreSQL y pool,
 los reintentos con la misma clave, los conflictos de contenido y
 los fallos de negocio consultables y enviados a la cola de fallidos. También
 cubren la espera sin consumidor, la reentrega después del commit y antes del
-`ACK` sin duplicar una devolución, los mensajes inválidos y la publicación sin
+`ACK` sin duplicar una devolución, los conflictos detectados en el worker sin
+alterar el resultado original, los mensajes inválidos y la publicación sin
 destino válido. Las pruebas de persistencia verifican la serialización de
 comandos concurrentes y la atomicidad de las escrituras; las unitarias cubren
 los errores del consumidor y de HTTP. Los contratos y el ejecutor de comandos

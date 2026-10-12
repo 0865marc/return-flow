@@ -59,7 +59,7 @@ def test_async_endpoint_publishes_without_mutating_the_delivery(client):
         (f"/deliveries/{uuid4()}/deliver-async", None, "ensure_delivery_delivered"),
     ],
 )
-def test_registers_before_publication_and_retries_with_the_same_identity(
+def test_publishes_without_registration_and_retries_with_the_same_identity(
     client, path, body, command_type
 ):
     command_id = uuid4()
@@ -67,7 +67,7 @@ def test_registers_before_publication_and_retries_with_the_same_identity(
     store = client.app.state.command_store
 
     async def publish(command):
-        assert store.records[command.command_id].status == "pending"
+        assert store.records == {}
 
     publisher = client.app.state.command_publisher
     publisher.publish.side_effect = publish
@@ -83,21 +83,35 @@ def test_registers_before_publication_and_retries_with_the_same_identity(
         first.headers["Location"] == second.headers["Location"]
         == f"/commands/{command_id}"
     )
-    assert len(store.records) == 1
+    assert store.records == {}
     assert publisher.publish.await_count == 2
     command = publisher.publish.call_args.args[0]
     assert command.command_id == command_id
     assert command.type == command_type
     if body is not None:
         assert command.delivery_id == UUID(body["delivery_id"])
-    assert client.get(first.headers["Location"]).json() == {
-        "command_id": str(command_id),
-        "type": command_type,
-        "status": "pending",
-        "result": None,
-        "error": None,
-    }
+    assert client.get(first.headers["Location"]).status_code == 404
     assert client.app.state.return_repository.returns == {}
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/deliveries-async", None),
+        ("/returns-async", {"delivery_id": str(uuid4())}),
+        (f"/deliveries/{uuid4()}/deliver-async", None),
+    ],
+)
+def test_acceptance_does_not_depend_on_command_persistence(client, path, body):
+    # A route dependency on the store would return 503 before reaching the broker.
+    client.app.state.command_store = None
+
+    response = client.post(
+        path, json=body, headers={"Idempotency-Key": str(uuid4())}
+    )
+
+    assert response.status_code == 202
+    client.app.state.command_publisher.publish.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -144,18 +158,19 @@ def test_invalid_return_body_is_not_registered_or_published(client, body):
     client.app.state.command_publisher.publish.assert_not_awaited()
 
 
-def test_same_key_cannot_be_reused_for_a_different_command_type(client):
+def test_same_key_with_a_different_command_type_is_forwarded_to_the_worker(client):
     headers = {"Idempotency-Key": str(uuid4())}
     assert client.post("/deliveries-async", headers=headers).status_code == 202
     response = client.post(
         "/returns-async", headers=headers, json={"delivery_id": str(uuid4())}
     )
-    assert response.status_code == 409
-    client.app.state.command_publisher.publish.assert_awaited_once()
+    assert response.status_code == 202
+    assert client.app.state.command_publisher.publish.await_count == 2
+    assert client.app.state.command_store.records == {}
 
 
 @pytest.mark.parametrize("operation", ["return", "deliver"])
-def test_same_key_cannot_be_reused_for_a_different_payload(client, operation):
+def test_same_key_with_a_different_payload_is_forwarded_to_the_worker(client, operation):
     headers = {"Idempotency-Key": str(uuid4())}
 
     def enqueue(delivery_id):
@@ -166,12 +181,13 @@ def test_same_key_cannot_be_reused_for_a_different_payload(client, operation):
         return client.post(f"/deliveries/{delivery_id}/deliver-async", headers=headers)
 
     assert enqueue(uuid4()).status_code == 202
-    assert enqueue(uuid4()).status_code == 409
-    client.app.state.command_publisher.publish.assert_awaited_once()
+    assert enqueue(uuid4()).status_code == 202
+    assert client.app.state.command_publisher.publish.await_count == 2
+    assert client.app.state.command_store.records == {}
 
 
 @pytest.mark.parametrize("command_status", ["completed", "failed"])
-def test_terminal_command_can_be_queried_and_is_not_republished(client, command_status):
+def test_terminal_command_can_be_queried_and_retries_are_republished(client, command_status):
     command_id = uuid4()
     headers = {"Idempotency-Key": str(command_id)}
     response = client.post("/deliveries-async", headers=headers)
@@ -180,11 +196,12 @@ def test_terminal_command_can_be_queried_and_is_not_republished(client, command_
     error = (
         "The operation could not be completed." if command_status == "failed" else None
     )
-    store.records[command_id] = store.records[command_id].model_copy(
-        update={"status": command_status, "result": result, "error": error}
+    # The worker has committed a result since the initial publication.
+    store.records[command_id] = CommandRecord(
+        command_id=command_id, type="create_delivery",
+        status=command_status, result=result, error=error,
     )
     publisher = client.app.state.command_publisher
-    client.app.state.command_publisher = None
 
     lookup = client.get(response.headers["Location"])
     assert lookup.status_code == 200
@@ -198,7 +215,15 @@ def test_terminal_command_can_be_queried_and_is_not_republished(client, command_
     retry = client.post("/deliveries-async", headers=headers)
     assert retry.status_code == 202
     assert retry.json() == response.json()
-    publisher.publish.assert_awaited_once()
+    assert publisher.publish.await_count == 2
+    assert client.get(response.headers["Location"]).json() == lookup.json()
+
+    # Even retries with an existing outcome require confirmed broker acceptance.
+    client.app.state.command_publisher = None
+    unavailable = client.post("/deliveries-async", headers=headers)
+    assert unavailable.status_code == 503
+    assert unavailable.json()["command_id"] == str(command_id)
+    assert client.get(response.headers["Location"]).json() == lookup.json()
 
 
 def test_unknown_command_returns_404(client):
@@ -240,7 +265,7 @@ def test_unconfirmed_publication_returns_id_and_can_be_retried(client, operation
     command_id = UUID(response.json()["command_id"])
     assert "could not be confirmed" in response.json()["detail"]
     assert f"Idempotency-Key: {command_id}" in response.json()["detail"]
-    assert client.get(response.headers["Location"]).json()["status"] == "pending"
+    assert client.get(response.headers["Location"]).status_code == 404
     original_command = publisher.publish.call_args.args[0]
 
     publisher.publish.side_effect = None
@@ -248,7 +273,7 @@ def test_unconfirmed_publication_returns_id_and_can_be_retried(client, operation
     assert retry.status_code == 202
     assert retry.json()["command_id"] == str(command_id)
     assert publisher.publish.call_args.args[0] == original_command
-    assert len(client.app.state.command_store.records) == 1
+    assert client.app.state.command_store.records == {}
 
 
 def test_unconfigured_messaging_returns_recoverable_503_while_sync_routes_work(client):
@@ -257,7 +282,7 @@ def test_unconfigured_messaging_returns_recoverable_503_while_sync_routes_work(c
     response = client.post(f"/deliveries/{delivery['id']}/deliver-async")
     assert response.status_code == 503
     assert UUID(response.json()["command_id"])
-    assert client.get(response.headers["Location"]).json()["status"] == "pending"
+    assert client.get(response.headers["Location"]).status_code == 404
     assert client.post(f"/deliveries/{delivery['id']}/deliver").status_code == 200
 
 
